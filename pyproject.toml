@@ -17,6 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
+gui = [
+  "PyQt6>=6.6,<7",
+  "pyinstaller>=6.3,<7"
+]
 
 [tool.setuptools.packages.find]
 include = ["vertex_proxy*"]
