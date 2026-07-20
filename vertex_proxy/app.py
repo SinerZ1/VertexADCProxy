@@ -34,6 +34,7 @@ _HOP_BY_HOP_HEADERS = {
 }
 _REQUEST_HEADERS_TO_DROP = _HOP_BY_HOP_HEADERS | {
     "authorization",
+    "content-length",
     "host",
     "x-api-key",
     "x-goog-api-key",
@@ -276,8 +277,8 @@ def create_app(
                 data = json.loads(body)
                 if isinstance(data, dict) and "model" in data and isinstance(data["model"], str):
                     model_name = data["model"]
-                    if model_name.startswith("google/"):
-                        data["model"] = model_name[len("google/"):]
+                    if "/" not in model_name:
+                        data["model"] = f"google/{model_name}"
                         body = json.dumps(data).encode("utf-8")
             except Exception as exc:
                 LOGGER.warning("Failed to preprocess request body model prefix: %s", exc)

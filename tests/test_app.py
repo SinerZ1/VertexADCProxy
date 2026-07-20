@@ -86,8 +86,12 @@ def test_openai_proxy_refreshes_adc_and_streams_response() -> None:
     assert upstream.headers.get("x-api-key") is None
     
     import json
-    upstream_body = json.loads(upstream.read())
-    assert upstream_body["model"] == "gemini-2.5-flash"
+    upstream_body_bytes = upstream.read()
+    assert "content-length" in upstream.headers
+    assert int(upstream.headers["content-length"]) == len(upstream_body_bytes)
+
+    upstream_body = json.loads(upstream_body_bytes)
+    assert upstream_body["model"] == "google/gemini-2.5-flash"
 
 
 def test_rejects_bad_proxy_key_before_adc_refresh() -> None:
