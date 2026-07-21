@@ -6,17 +6,15 @@ import json
 import re
 import secrets
 import logging
-import asyncio
 from pathlib import Path
-from typing import Mapping
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QLineEdit, QComboBox, QCheckBox, QPushButton, 
     QGroupBox, QTextEdit, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu, QStyle
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QIcon, QAction, QIntValidator
+from PyQt6.QtCore import QThread, pyqtSignal, QObject
+from PyQt6.QtGui import QAction, QIntValidator
 
 # Logger setup
 LOGGER = logging.getLogger("vertex_proxy_gui")
@@ -885,7 +883,7 @@ class VertexProxyApp(QMainWindow):
         location = self.cmb_location.currentText().strip()
         
         # Standard models configuration returned for /v1/models (from user configuration or default)
-        models = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3.1-flash,gemini-3.1-pro-preview"
+        models = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.1-pro-preview"
         
         # Default timeouts
         connect_timeout = 10.0
