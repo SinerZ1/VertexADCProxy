@@ -10,6 +10,7 @@
 - ADC Token 提前刷新；上游返回 401 时强制刷新并重试一次
 - ADC 刷新和 Vertex HTTP 请求均支持读取 HTTP_PROXY、HTTPS_PROXY、NO_PROXY
 - 可选的本地 API Key 认证，防止代理接口在本地或网络中未授权访问
+- 完善的客户端请求和上游响应日志记录（支持全量、不输出、仅输出 messages 部分 3 种粒度选择，自动美化 JSON 输出）
 
 ## 安装与启动
 
@@ -43,6 +44,9 @@
 
    rem 可选：仅用于 GET /v1/models 的本地模型列表响应
    set VERTEX_MODELS=google/gemini-2.5-flash,google/gemini-2.5-pro
+
+   rem 可选：日志记录输出模式 (full:全量, messages:仅消息体, none:不输出)
+   set VERTEX_PROXY_LOG_MODE=full
    ```
 
    如果使用 PowerShell，请使用以下格式配置环境变量：
@@ -53,6 +57,7 @@
    $env:HTTPS_PROXY="http://127.0.0.1:7890"
    $env:VERTEX_PROXY_API_KEY="change-me"
    $env:VERTEX_MODELS="google/gemini-2.5-flash,google/gemini-2.5-pro"
+   $env:VERTEX_PROXY_LOG_MODE="full"
    ```
 
 5. 启动服务：
@@ -126,6 +131,7 @@ https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LO
 | --- | ---: | --- |
 | `VERTEX_PROXY_API_KEY` | 未设置 | 设置后要求请求携带 `Authorization: Bearer ...` 或 `X-API-Key` 请求头 |
 | `VERTEX_MODELS` | 空 | `/v1/models` 接口返回的逗号分隔的模型列表 |
+| `VERTEX_PROXY_LOG_MODE` | `full` | 日志记录输出模式（full: 全量输出, messages: 仅输出 request 消息体, none: 不输出） |
 | `VERTEX_CONNECT_TIMEOUT` | `10` | 连接上游服务的超时时间，单位为秒 |
 | `VERTEX_READ_TIMEOUT` | `300` | 读取上游服务的超时时间，单位为秒；设为 `0` 表示无限制 |
 | `VERTEX_TOKEN_REFRESH_SKEW` | `300` | Token 到期前多少秒执行主动刷新操作 |
@@ -147,6 +153,7 @@ docker run --rm -p 8000:8000 ^
   -e HTTP_PROXY ^
   -e HTTPS_PROXY ^
   -e VERTEX_PROXY_API_KEY ^
+  -e VERTEX_PROXY_LOG_MODE ^
   -v "%USERPROFILE%/.config/gcloud:/root/.config/gcloud:ro" ^
   vertex-adc-proxy
 ```
@@ -167,9 +174,10 @@ pip install -e .[test]
 
 - 一键服务启停：在独立后台线程中安全启动/停止 FastAPI 代理服务，完全不影响界面交互和流畅度。
 - 本地凭据检测 (ADC)：自动扫描电脑中的 Google ADC 授权文件，实时显示当前 ADC 的有效状态。
-- 网络连接测试 (GCP Connection Test)：支持在界面中快速选择模型（如 gemini-3.5-flash、gemini-3.1-flash 等）向 Google Cloud 发送 PING 握手包，快速检测本地凭据和网络代理连通性。
+- 网络连接测试 (GCP Connection Test)：支持在界面中快速选择模型向 Google Cloud 发送 PING 握手包，快速检测本地凭据和网络代理连通性。
 - 网络代理配置：内置独立的 HTTP_PROXY / HTTPS_PROXY 设置，支持独立开启、隔离或借用全局系统代理。
 - 自定义 API Key：支持一键生成并安全显示/隐藏以 sk- 开头的本地保护密钥。
+- 动态日志记录配置：针对Request & Response内容支持在“全量输出”、“不输出”及“仅输出 Request messages”之间切换。
 - 系统托盘运行：关闭窗口时自动最小化至系统右下角托盘在后台静默运行，支持托盘气泡通知与完整的右键上下文菜单。
 - 配置自动持久化：自动在本地保存所有偏好设置，下次启动时自动加载并一键复原。
 

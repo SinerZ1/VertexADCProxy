@@ -173,6 +173,42 @@ def _response_headers(response: httpx.Response) -> dict[str, str]:
     }
 
 
+def _format_json(text: str) -> str:
+    if not text:
+        return text
+    try:
+        import json
+        parsed = json.loads(text)
+        return json.dumps(parsed, indent=2, ensure_ascii=False)
+    except Exception:
+        return text
+
+
+def _decompress_response(body: bytes, headers: Mapping[str, str]) -> bytes:
+    content_encoding = headers.get("content-encoding", "").lower()
+    if not content_encoding or not body:
+        return body
+    try:
+        if "gzip" in content_encoding:
+            import gzip
+            return gzip.decompress(body)
+        elif "deflate" in content_encoding:
+            import zlib
+            try:
+                return zlib.decompress(body)
+            except zlib.error:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+        elif "br" in content_encoding:
+            try:
+                import brotli
+                return brotli.decompress(body)
+            except ImportError:
+                pass
+    except Exception as exc:
+        LOGGER.warning("Decompression failed: %s", exc)
+    return body
+
+
 def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -266,11 +302,26 @@ def create_app(
         }
 
     async def proxy(request: Request, upstream_url: str):
+        req_id = secrets.token_hex(4)
         config: Settings = request.app.state.settings
-        if not _authorized(request, config.proxy_api_key):
-            return _error(401, "Invalid proxy API key", "authentication_error")
+        log_mode = os.environ.get("VERTEX_PROXY_LOG_MODE", "full")
 
         body = await request.body()
+
+        if not _authorized(request, config.proxy_api_key):
+            LOGGER.warning(
+                "[%s] Unauthorized request: %s %s",
+                req_id,
+                request.method,
+                request.url,
+            )
+            if log_mode == "full":
+                LOGGER.info(
+                    "[%s] Completed response: Status 401 | Body: Invalid proxy API key",
+                    req_id,
+                )
+            return _error(401, "Invalid proxy API key", "authentication_error")
+
         if body and "application/json" in request.headers.get("content-type", "").lower():
             try:
                 import json
@@ -282,6 +333,49 @@ def create_app(
                         body = json.dumps(data).encode("utf-8")
             except Exception as exc:
                 LOGGER.warning("Failed to preprocess request body model prefix: %s", exc)
+
+        req_headers = {}
+        for name, value in request.headers.items():
+            name_lower = name.lower()
+            if name_lower in {"authorization", "x-api-key", "x-goog-api-key"} or "signature" in name_lower or "auth" in name_lower:
+                continue
+            req_headers[name] = value
+
+        req_body_str = ""
+        if body:
+            try:
+                req_body_str = body.decode("utf-8", errors="replace")
+            except Exception:
+                req_body_str = "<binary or undecodable body>"
+
+        if log_mode == "full":
+            LOGGER.info(
+                "[%s] Received request: %s %s | Headers: %s | Body: %s",
+                req_id,
+                request.method,
+                request.url,
+                req_headers,
+                _format_json(req_body_str),
+            )
+        elif log_mode == "messages":
+            messages = None
+            if body:
+                try:
+                    import json
+                    data = json.loads(body)
+                    if isinstance(data, dict) and "messages" in data:
+                        messages = data["messages"]
+                except Exception:
+                    pass
+            if messages is not None:
+                try:
+                    import json
+                    msg_str = json.dumps(messages, indent=2, ensure_ascii=False)
+                except Exception:
+                    msg_str = str(messages)
+                LOGGER.info("[%s] Request messages: %s", req_id, msg_str)
+            else:
+                LOGGER.info("[%s] Request Body: %s", req_id, _format_json(req_body_str))
 
         client: httpx.AsyncClient = request.app.state.upstream_client
         token_provider: AdcTokenProvider = request.app.state.token_provider
@@ -309,10 +403,46 @@ def create_app(
                 response = await client.send(upstream_request, stream=True)
         except Exception as exc:
             LOGGER.warning("Vertex upstream request failed: %s", exc.__class__.__name__)
+            if log_mode == "full":
+                LOGGER.info(
+                    "[%s] Completed response: Status 502 | Body: Vertex upstream unavailable",
+                    req_id,
+                )
             return _error(502, "Vertex upstream unavailable", "upstream_error")
 
+        async def logged_stream_generator():
+            accumulated_chunks = []
+            try:
+                async for chunk in response.aiter_raw():
+                    accumulated_chunks.append(chunk)
+                    yield chunk
+            finally:
+                if log_mode == "full":
+                    decompressed_body = _decompress_response(b"".join(accumulated_chunks), response.headers)
+                    content_type = response.headers.get("content-type", "").lower()
+                    charset = "utf-8"
+                    if "charset=" in content_type:
+                        try:
+                            charset = content_type.split("charset=")[-1].strip().split(";")[0]
+                        except Exception:
+                            charset = "utf-8"
+                    
+                    try:
+                        resp_body_str = decompressed_body.decode(charset, errors="replace")
+                    except Exception:
+                        resp_body_str = "<binary or undecodable response>"
+                    
+                    resp_headers = dict(_response_headers(response))
+                    LOGGER.info(
+                        "[%s] Completed response: Status %s | Headers: %s | Body: %s",
+                        req_id,
+                        response.status_code,
+                        resp_headers,
+                        _format_json(resp_body_str),
+                    )
+
         return StreamingResponse(
-            response.aiter_raw(),
+            logged_stream_generator(),
             status_code=response.status_code,
             headers=_response_headers(response),
             background=BackgroundTask(response.aclose),

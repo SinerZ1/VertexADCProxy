@@ -164,3 +164,88 @@ def test_native_proxy_builds_project_scoped_url() -> None:
         "locations/asia-east1/publishers/google/models/"
         "gemini-2.5-flash:generateContent"
     ]
+
+
+def test_request_response_logging(caplog) -> None:
+    import logging
+    import os
+    credentials = FakeCredentials()
+    
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=AsyncBytes(b'{"response_ok":true}'),
+        )
+
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        proxy_api_key="local-secret",
+    )
+    app = create_app(
+        settings,
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+
+    # 1. Test "full" log mode (default)
+    os.environ["VERTEX_PROXY_LOG_MODE"] = "full"
+    with caplog.at_level(logging.INFO, logger="vertex_proxy"):
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer local-secret", "x-custom-header": "test-val"},
+                json={"model": "gemini-2.5-flash", "test_key": "test_val"},
+            )
+
+    assert response.status_code == 200
+    log_records = [rec.message for rec in caplog.records if rec.name == "vertex_proxy"]
+    received_logs = [log for log in log_records if "Received request" in log]
+    completed_logs = [log for log in log_records if "Completed response" in log]
+    
+    assert len(received_logs) == 1
+    assert len(completed_logs) == 1
+    
+    # Verify signature "authorization" is excluded from output
+    assert "authorization" not in received_logs[0]
+    assert "Bearer" not in received_logs[0]
+    assert "test-val" in received_logs[0]
+    assert "google/gemini-2.5-flash" in received_logs[0]  # The preprocessed model and formatted JSON
+    assert "test_key" in received_logs[0]
+    # Check that it contains formatted JSON with newlines
+    assert "\n  \"response_ok\": true" in completed_logs[0]
+
+    # 2. Test "none" log mode
+    caplog.clear()
+    os.environ["VERTEX_PROXY_LOG_MODE"] = "none"
+    with caplog.at_level(logging.INFO, logger="vertex_proxy"):
+        with TestClient(app) as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer local-secret"},
+                json={"model": "gemini-2.5-flash"},
+            )
+    log_records_none = [rec.message for rec in caplog.records if rec.name == "vertex_proxy"]
+    assert not any("Received request" in log or "Completed response" in log for log in log_records_none)
+
+    # 3. Test "messages" log mode
+    caplog.clear()
+    os.environ["VERTEX_PROXY_LOG_MODE"] = "messages"
+    with caplog.at_level(logging.INFO, logger="vertex_proxy"):
+        with TestClient(app) as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer local-secret"},
+                json={
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "user", "content": "hello_test_message"}]
+                },
+            )
+    log_records_msg = [rec.message for rec in caplog.records if rec.name == "vertex_proxy"]
+    msg_logs = [log for log in log_records_msg if "Request messages" in log]
+    completed_logs_msg = [log for log in log_records_msg if "Completed response" in log]
+    
+    assert len(msg_logs) == 1
+    assert "hello_test_message" in msg_logs[0]
+    assert len(completed_logs_msg) == 0  # No response logged in messages mode

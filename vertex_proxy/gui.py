@@ -504,7 +504,7 @@ class VertexProxyApp(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("Vertex AI ADC Proxy 桌面版")
-        self.resize(800, 650)
+        self.resize(1350, 650)
         self.setStyleSheet(DARK_STYLE)
 
         # Set Window icon using standard system icons to avoid missing external file
@@ -707,6 +707,27 @@ class VertexProxyApp(QMainWindow):
         logs_actions.addWidget(self.chk_auto_scroll)
         logs_actions.addStretch()
 
+        # Log option button with menu
+        self.btn_log_options = QPushButton("日志选项: 全量输出")
+        self.btn_log_options.setObjectName("btn_log_options")
+        self.log_menu = QMenu(self)
+        
+        self.act_no_log = QAction("不输出Request和Response", self)
+        self.act_full_log = QAction("全量输出Request和Response", self)
+        self.act_messages_log = QAction("只输出Request的body部分（messages）", self)
+        
+        self.log_menu.addAction(self.act_no_log)
+        self.log_menu.addAction(self.act_full_log)
+        self.log_menu.addAction(self.act_messages_log)
+        
+        self.btn_log_options.setMenu(self.log_menu)
+        
+        self.act_no_log.triggered.connect(lambda: self.set_log_mode("none"))
+        self.act_full_log.triggered.connect(lambda: self.set_log_mode("full"))
+        self.act_messages_log.triggered.connect(lambda: self.set_log_mode("messages"))
+        
+        logs_actions.addWidget(self.btn_log_options)
+
         btn_clear_log = QPushButton("清除日志")
         btn_clear_log.clicked.connect(self.clear_logs)
         logs_actions.addWidget(btn_clear_log)
@@ -785,6 +806,7 @@ class VertexProxyApp(QMainWindow):
             # Set initial default fields
             self.chk_use_proxy.setChecked(False)
             self.toggle_proxy_fields(False)
+            self.set_log_mode("full")
             return
 
         self.txt_port.setText(str(config.get("port", "10101")))
@@ -805,6 +827,9 @@ class VertexProxyApp(QMainWindow):
         self.txt_http_proxy.setText(config.get("http_proxy", ""))
         self.txt_https_proxy.setText(config.get("https_proxy", ""))
 
+        log_mode = config.get("log_mode", "full")
+        self.set_log_mode(log_mode)
+
     def save_current_settings(self):
         config = {
             "port": int(self.txt_port.text().strip() or "10101"),
@@ -815,6 +840,30 @@ class VertexProxyApp(QMainWindow):
             "use_proxy": self.chk_use_proxy.isChecked(),
             "http_proxy": self.txt_http_proxy.text().strip(),
             "https_proxy": self.txt_https_proxy.text().strip(),
+            "log_mode": getattr(self, "_log_mode", "full"),
+        }
+        save_config(config)
+
+    def set_log_mode(self, mode: str):
+        self._log_mode = mode
+        os.environ["VERTEX_PROXY_LOG_MODE"] = mode
+        if mode == "none":
+            self.btn_log_options.setText("日志选项: 不输出")
+        elif mode == "messages":
+            self.btn_log_options.setText("日志选项: messages部分")
+        else:
+            self.btn_log_options.setText("日志选项: 全量输出")
+        # Save config only after attributes are set to prevent infinite recursion
+        config = {
+            "port": int(self.txt_port.text().strip() or "10101"),
+            "api_key": self.txt_api_key.text().strip(),
+            "project": self.txt_project.text().strip(),
+            "location": self.cmb_location.currentText().strip(),
+            "creds_path": self.txt_creds_path.text().strip(),
+            "use_proxy": self.chk_use_proxy.isChecked(),
+            "http_proxy": self.txt_http_proxy.text().strip(),
+            "https_proxy": self.txt_https_proxy.text().strip(),
+            "log_mode": mode,
         }
         save_config(config)
 
