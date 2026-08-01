@@ -131,7 +131,7 @@ https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LO
 | --- | ---: | --- |
 | `VERTEX_PROXY_API_KEY` | 未设置 | 设置后要求请求携带 `Authorization: Bearer ...` 或 `X-API-Key` 请求头 |
 | `VERTEX_MODELS` | 空 | `/v1/models` 接口返回的逗号分隔的模型列表 |
-| `VERTEX_PROXY_LOG_MODE` | `full` | 日志记录输出模式（full: 全量输出, messages: 仅输出 request 消息体, none: 不输出） |
+| `VERTEX_PROXY_LOG_MODE` | `full` | 日志记录输出模式（full: 全量输出, messages: 仅输出 request 消息体, errors: 仅输出 content_filter 响应错误, none: 不输出） |
 | `VERTEX_CONNECT_TIMEOUT` | `10` | 连接上游服务的超时时间，单位为秒 |
 | `VERTEX_READ_TIMEOUT` | `300` | 读取上游服务的超时时间，单位为秒；设为 `0` 表示无限制 |
 | `VERTEX_TOKEN_REFRESH_SKEW` | `300` | Token 到期前多少秒执行主动刷新操作 |
@@ -177,7 +177,7 @@ pip install -e .[test]
 - 网络连接测试 (GCP Connection Test)：支持在界面中快速选择模型向 Google Cloud 发送 PING 握手包，快速检测本地凭据和网络代理连通性。
 - 网络代理配置：内置独立的 HTTP_PROXY / HTTPS_PROXY 设置，支持独立开启、隔离或借用全局系统代理。
 - 自定义 API Key：支持一键生成并安全显示/隐藏以 sk- 开头的本地保护密钥。
-- 动态日志记录配置：针对Request & Response内容支持在“全量输出”、“不输出”及“仅输出 Request messages”之间切换。
+- 动态日志记录配置：针对Request & Response内容支持在“全量输出”、“不输出”、“仅输出 Request messages”以及“仅输出 Response content_filter 错误”之间切换。
 - 系统托盘运行：关闭窗口时自动最小化至系统右下角托盘在后台静默运行，支持托盘气泡通知与完整的右键上下文菜单。
 - 配置自动持久化：自动在本地保存所有偏好设置，下次启动时自动加载并一键复原。
 

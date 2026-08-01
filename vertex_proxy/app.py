@@ -417,7 +417,7 @@ def create_app(
                     accumulated_chunks.append(chunk)
                     yield chunk
             finally:
-                if log_mode == "full":
+                if log_mode == "full" or log_mode == "errors":
                     decompressed_body = _decompress_response(b"".join(accumulated_chunks), response.headers)
                     content_type = response.headers.get("content-type", "").lower()
                     charset = "utf-8"
@@ -432,14 +432,16 @@ def create_app(
                     except Exception:
                         resp_body_str = "<binary or undecodable response>"
                     
-                    resp_headers = dict(_response_headers(response))
-                    LOGGER.info(
-                        "[%s] Completed response: Status %s | Headers: %s | Body: %s",
-                        req_id,
-                        response.status_code,
-                        resp_headers,
-                        _format_json(resp_body_str),
-                    )
+                    is_cf_error = "content_filter" in resp_body_str
+                    if log_mode == "full" or (log_mode == "errors" and is_cf_error):
+                        resp_headers = dict(_response_headers(response))
+                        LOGGER.info(
+                            "[%s] Completed response: Status %s | Headers: %s | Body: %s",
+                            req_id,
+                            response.status_code,
+                            resp_headers,
+                            _format_json(resp_body_str),
+                        )
 
         return StreamingResponse(
             logged_stream_generator(),

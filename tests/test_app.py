@@ -249,3 +249,43 @@ def test_request_response_logging(caplog) -> None:
     assert len(msg_logs) == 1
     assert "hello_test_message" in msg_logs[0]
     assert len(completed_logs_msg) == 0  # No response logged in messages mode
+
+    # 4. Test "errors" log mode
+    # 4.1 A successful response without content_filter
+    caplog.clear()
+    os.environ["VERTEX_PROXY_LOG_MODE"] = "errors"
+    with caplog.at_level(logging.INFO, logger="vertex_proxy"):
+        with TestClient(app) as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer local-secret"},
+                json={"model": "gemini-2.5-flash"},
+            )
+    log_records_err1 = [rec.message for rec in caplog.records if rec.name == "vertex_proxy"]
+    assert not any("Completed response" in log for log in log_records_err1)
+
+    # 4.2 A response with content_filter
+    # Create a new app instance with a mock handler that returns content_filter error
+    async def filter_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=AsyncBytes(b'{"choices":[{"delta":{"refusal":"sensitive"},"finish_reason":"content_filter"}]}'),
+        )
+    app_filter = create_app(
+        settings,
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(filter_handler),
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="vertex_proxy"):
+        with TestClient(app_filter) as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer local-secret"},
+                json={"model": "gemini-2.5-flash"},
+            )
+    log_records_err2 = [rec.message for rec in caplog.records if rec.name == "vertex_proxy"]
+    err2_completed = [log for log in log_records_err2 if "Completed response" in log]
+    assert len(err2_completed) == 1
+    assert "content_filter" in err2_completed[0]

@@ -15,7 +15,7 @@ The application fails to start if either of these is missing or invalid:
 ### Optional Configurations
 - `VERTEX_PROXY_API_KEY`: If set, incoming requests must use `Authorization: Bearer <key>` or `X-API-Key` headers. Otherwise, a 401 is returned.
 - `VERTEX_MODELS`: Comma-separated list returned by `/v1/models`.
-- `VERTEX_PROXY_LOG_MODE`: Logging mode configuration. Can be set to `full` (default, logs full request/response), `messages` (logs request messages only), or `none` (logs no request/response).
+- `VERTEX_PROXY_LOG_MODE`: Logging mode configuration. Can be set to `full` (default, logs full request/response), `messages` (logs request messages only), `errors` (logs responses containing `content_filter`), or `none` (logs no request/response).
 
 ## Architectural Mechanics
 - **Upstream Host Translation:**
@@ -33,6 +33,7 @@ The application fails to start if either of these is missing or invalid:
   - Log modes are configured via `VERTEX_PROXY_LOG_MODE` env variable:
     - `full`: Logs both request and response in full detail.
     - `messages`: Logs only the request body's messages key array, with fallback to formatting the entire request body. Responses are not logged.
+    - `errors`: Logs only the completed responses containing `content_filter` error.
     - `none`: Completely disables request and response logs.
   - JSON formatting: Any valid JSON logs are automatically parsed and formatted using json.dumps with 2-space indentation.
   - Signature filtering: Headers containing credentials or signatures (including `authorization`, `x-api-key`, `x-goog-api-key`, or names with `signature` or `auth`) are automatically stripped from logs for safety.

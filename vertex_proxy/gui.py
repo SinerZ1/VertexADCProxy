@@ -11,10 +11,10 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QLineEdit, QComboBox, QCheckBox, QPushButton, 
-    QGroupBox, QTextEdit, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu, QStyle
+    QGroupBox, QTextEdit, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu, QStyle, QListView
 )
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QAction, QIntValidator
+from PyQt6.QtCore import QThread, pyqtSignal, QObject, QEvent, Qt
+from PyQt6.QtGui import QAction, QIntValidator, QStandardItemModel, QStandardItem
 
 # Logger setup
 LOGGER = logging.getLogger("vertex_proxy_gui")
@@ -24,6 +24,65 @@ _ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 def strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub('', text)
+
+
+class CheckableComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.setView(QListView(self))
+        self.view().viewport().installEventFilter(self)
+        self.setModel(QStandardItemModel(self))
+        self.model().dataChanged.connect(self.update_display_text)
+
+    def eventFilter(self, widget, event):
+        if widget == self.view().viewport():
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                index = self.view().indexAt(event.pos())
+                item = self.model().itemFromIndex(index)
+                if item is not None:
+                    if item.checkState() == Qt.CheckState.Checked:
+                        item.setCheckState(Qt.CheckState.Unchecked)
+                    else:
+                        item.setCheckState(Qt.CheckState.Checked)
+                return True
+        return super().eventFilter(widget, event)
+
+    def addItem(self, text: str, checked: bool = False):
+        item = QStandardItem(text)
+        item.setCheckable(True)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.model().appendRow(item)
+        self.update_display_text()
+
+    def update_display_text(self):
+        checked_texts = []
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                checked_texts.append(item.text())
+        self.setEditText(", ".join(checked_texts))
+
+    def checked_items(self) -> list[str]:
+        checked = []
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                checked.append(item.text())
+        return checked
+
+    def set_checked_items(self, items: list[str]):
+        self.model().blockSignals(True)
+        for i in range(self.model().rowCount()):
+            item = self.model().item(i)
+            if item:
+                if item.text() in items:
+                    item.setCheckState(Qt.CheckState.Checked)
+                else:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+        self.model().blockSignals(False)
+        self.update_display_text()
 
 
 def locate_adc_file(configured_path: str | None = None) -> tuple[bool, str]:
@@ -261,14 +320,13 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 """
 
 
-class ConnectionTestThread(QThread):
-    finished = pyqtSignal(bool, str)
+class FetchModelsThread(QThread):
+    finished = pyqtSignal(bool, list, str)
 
-    def __init__(self, project: str, location: str, model: str, creds_path: str, use_proxy: bool, http_proxy: str, https_proxy: str):
+    def __init__(self, project: str, location: str, creds_path: str, use_proxy: bool, http_proxy: str, https_proxy: str):
         super().__init__()
         self.project = project
         self.location = location
-        self.model = model
         self.creds_path = creds_path
         self.use_proxy = use_proxy
         self.http_proxy = http_proxy
@@ -310,14 +368,10 @@ class ConnectionTestThread(QThread):
             try:
                 credentials, project_from_creds = google.auth.default(scopes=scopes)
             except Exception as e:
-                self.finished.emit(False, f"获取 Google ADC 默认凭证失败: {e}\n\n请验证您的 ADC 文件。")
+                self.finished.emit(False, [], f"获取 Google ADC 默认凭证失败: {e}\n\n请验证您的 ADC 文件。")
                 return
 
             resolved_project = self.project or project_from_creds or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            if not resolved_project:
-                self.finished.emit(False, "缺少 GCP 项目 ID。请在界面输入 GOOGLE_CLOUD_PROJECT。")
-                return
-
             resolved_location = self.location or os.environ.get("VERTEX_LOCATION") or "us-central1"
 
             # Refresh token
@@ -326,15 +380,67 @@ class ConnectionTestThread(QThread):
                 credentials.refresh(auth_request)
                 token = credentials.token
                 if not token:
-                    self.finished.emit(False, "刷新 token 失败: ADC 未返回 Access Token。")
+                    self.finished.emit(False, [], "刷新 token 失败: ADC 未返回 Access Token。")
                     return
             except Exception as e:
-                self.finished.emit(False, f"刷新 Access Token 失败: {e}\n\n原因可能是网络不通，或 ADC 凭证已过期/无效。")
+                self.finished.emit(False, [], f"刷新 Access Token 失败: {e}\n\n原因可能是网络不通，或 ADC 凭证已过期/无效。")
                 return
 
-            # Construct Native Vertex endpoint
             host = "aiplatform.googleapis.com" if resolved_location == "global" else f"{resolved_location}-aiplatform.googleapis.com"
-            url = f"https://{host}/v1/projects/{resolved_project}/locations/{resolved_location}/publishers/google/models/{self.model}:generateContent"
+            
+            # We will try candidate URLs to fetch the publisher models list
+            candidates = []
+            
+            # 1. Standard Vertex AI models endpoint using query_base=true to list foundation/base models (as used by official genai library)
+            if resolved_project:
+                candidates.append((
+                    f"https://{host}/v1beta1/projects/{resolved_project}/locations/{resolved_location}/models",
+                    {"query_base": "true", "page_size": 300}
+                ))
+                candidates.append((
+                    f"https://{host}/v1/projects/{resolved_project}/locations/{resolved_location}/models",
+                    {"query_base": "true", "page_size": 300}
+                ))
+
+            # 2. Backups using Model Garden publishers endpoint
+            candidates.append((
+                f"https://{host}/v1/publishers/google/models",
+                {"page_size": 300}
+            ))
+            candidates.append((
+                f"https://{host}/v1beta1/publishers/google/models",
+                {"page_size": 300}
+            ))
+            if resolved_project:
+                candidates.append((
+                    f"https://{host}/v1/projects/{resolved_project}/locations/{resolved_location}/publishers/google/models",
+                    {"page_size": 300}
+                ))
+                candidates.append((
+                    f"https://{host}/v1beta1/projects/{resolved_project}/locations/{resolved_location}/publishers/google/models",
+                    {"page_size": 300}
+                ))
+
+            # 3. Ultimate Fallbacks using us-central1 (which supports both models and publishers endpoints)
+            if resolved_location != "us-central1":
+                fb_host = "us-central1-aiplatform.googleapis.com"
+                if resolved_project:
+                    candidates.append((
+                        f"https://{fb_host}/v1beta1/projects/{resolved_project}/locations/us-central1/models",
+                        {"query_base": "true", "page_size": 300}
+                    ))
+                    candidates.append((
+                        f"https://{fb_host}/v1/projects/{resolved_project}/locations/us-central1/models",
+                        {"query_base": "true", "page_size": 300}
+                    ))
+                candidates.append((
+                    f"https://{fb_host}/v1/publishers/google/models",
+                    {"page_size": 300}
+                ))
+                candidates.append((
+                    f"https://{fb_host}/v1beta1/publishers/google/models",
+                    {"page_size": 300}
+                ))
 
             # Setup session
             session = requests.Session()
@@ -350,25 +456,34 @@ class ConnectionTestThread(QThread):
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             }
-            body = {
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": "ping"}]
-                    }
-                ]
-            }
+            if resolved_project:
+                headers["X-Goog-User-Project"] = resolved_project
 
-            try:
-                response = session.post(url, json=body, headers=headers, timeout=12)
-            except Exception as e:
-                self.finished.emit(False, f"向 Vertex AI 发送请求网络异常:\n{e}\n\n请检查代理和网络设置。")
-                return
+            last_error = ""
+            for url, params in candidates:
+                try:
+                    response = session.get(url, headers=headers, params=params, timeout=15)
+                    if response.status_code == 200:
+                        data = response.json()
+                        models_list = []
+                        # Correctly support both "models" (from projects.locations.models.list)
+                        # and "publisherModels" (from publishers.models.list)
+                        raw_list = data.get("models", []) or data.get("publisherModels", [])
+                        for model_obj in raw_list:
+                            name_path = model_obj.get("name", "")
+                            if name_path:
+                                model_id = name_path.split("/")[-1].split("@")[0]
+                                if model_id.startswith("gemini-") and model_id not in models_list:
+                                    models_list.append(model_id)
+                        
+                        self.finished.emit(True, models_list, "")
+                        return
+                    else:
+                        last_error = f"HTTP {response.status_code}: {response.text}"
+                except Exception as e:
+                    last_error = str(e)
 
-            if response.status_code == 200:
-                self.finished.emit(True, f"测试成功！\n\n- 项目 ID: {resolved_project}\n- 区域: {resolved_location}\n- 选用模型: {self.model}\n- 响应成功: HTTP 200 OK")
-            else:
-                self.finished.emit(False, f"上游 API 响应错误 (HTTP {response.status_code})\n\n内容: {response.text}\n\n请检查项目、区域及模型是否开通或匹配。")
+            self.finished.emit(False, [], f"获取模型列表失败，已尝试所有备用接口。\n\n最后一次错误: {last_error}")
 
         finally:
             # Restore original env variables
@@ -505,6 +620,7 @@ class VertexProxyApp(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Vertex AI ADC Proxy 桌面版")
         self.resize(1350, 650)
+        self.setMinimumWidth(1350)
         self.setStyleSheet(DARK_STYLE)
 
         # Set Window icon using standard system icons to avoid missing external file
@@ -519,10 +635,11 @@ class VertexProxyApp(QMainWindow):
 
         # Left Column: Configuration
         left_panel = QWidget()
+        left_panel.setFixedWidth(550)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
-        main_layout.addWidget(left_panel, stretch=4)
+        main_layout.addWidget(left_panel)
 
         # Title
         title_widget = QWidget()
@@ -605,22 +722,15 @@ class VertexProxyApp(QMainWindow):
         grid_gcp.addWidget(self.lbl_adc_status, 3, 1)
 
         # Connection testing controls
-        grid_gcp.addWidget(QLabel("网络连接测试模型:"), 4, 0)
+        grid_gcp.addWidget(QLabel("代理模型列表:"), 4, 0)
         test_hbox = QHBoxLayout()
-        self.cmb_test_model = QComboBox()
-        self.cmb_test_model.setEditable(True)
-        self.cmb_test_model.addItems([
-            "gemini-3.1-flash-lite",
-            "gemini-3.1-flash",
-            "gemini-3.1-pro-preview",
-            "gemini-3.5-flash",
-        ])
-        self.cmb_test_model.setToolTip("用于测试 GCP 连通性的模型，支持自定义输入")
+        self.cmb_test_model = CheckableComboBox()
+        self.cmb_test_model.setToolTip("选择需要代理的 Google Vertex AI Gemini 模型（支持多选）")
         test_hbox.addWidget(self.cmb_test_model)
         
-        self.btn_test_conn = QPushButton("测试连接")
+        self.btn_test_conn = QPushButton("获取模型")
         self.btn_test_conn.clicked.connect(self.test_connectivity)
-        self.btn_test_conn.setToolTip("向 Google Cloud 目标模型发送轻量级请求，测试 ADC 凭据与网络代理是否正常")
+        self.btn_test_conn.setToolTip("直接和 Vertex AI 通信并自动获取最新的 Gemini 官方模型列表")
         test_hbox.addWidget(self.btn_test_conn)
         grid_gcp.addLayout(test_hbox, 4, 1)
 
@@ -656,39 +766,37 @@ class VertexProxyApp(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(10)
-        main_layout.addWidget(right_panel, stretch=5)
+        main_layout.addWidget(right_panel, stretch=1)
 
-        # Status and Controls Area
+        # Status and Controls Area (combining status and buttons in one row)
         ctrl_panel = QWidget()
         ctrl_hbox = QHBoxLayout(ctrl_panel)
         ctrl_hbox.setContentsMargins(0, 0, 0, 0)
         ctrl_hbox.setSpacing(10)
 
-        self.btn_start = QPushButton(" 启动代理 ")
-        self.btn_start.setObjectName("btn_start")
-        self.btn_start.clicked.connect(self.start_proxy)
-        ctrl_hbox.addWidget(self.btn_start)
+        # Left-aligned status labels
+        lbl_status_prefix = QLabel("当前状态: ")
+        self.lbl_server_status = QLabel("已停止")
+        self.lbl_server_status.setStyleSheet("color: #888888; font-weight: bold;")
+        ctrl_hbox.addWidget(lbl_status_prefix)
+        ctrl_hbox.addWidget(self.lbl_server_status)
 
-        self.btn_stop = QPushButton(" 停止代理 ")
-        self.btn_stop.setObjectName("btn_stop")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_proxy)
-        ctrl_hbox.addWidget(self.btn_stop)
+        # Stretch spacer in the middle to push buttons to the right
+        ctrl_hbox.addStretch()
+
+        # Right-aligned buttons
+        self.btn_toggle_proxy = QPushButton(" 启动代理 ")
+        self.btn_toggle_proxy.setObjectName("btn_start")
+        self.btn_toggle_proxy.setFixedWidth(100)
+        self.btn_toggle_proxy.clicked.connect(self.toggle_proxy_action)
+        ctrl_hbox.addWidget(self.btn_toggle_proxy)
 
         self.btn_copy_url = QPushButton("复制 API URL")
+        self.btn_copy_url.setFixedWidth(100)
         self.btn_copy_url.clicked.connect(self.copy_api_url)
         ctrl_hbox.addWidget(self.btn_copy_url)
 
         right_layout.addWidget(ctrl_panel)
-
-        # Server Status Bar label
-        status_bar = QHBoxLayout()
-        status_bar.addWidget(QLabel("当前状态: "))
-        self.lbl_server_status = QLabel("已停止")
-        self.lbl_server_status.setStyleSheet("color: #888888; font-weight: bold;")
-        status_bar.addWidget(self.lbl_server_status)
-        status_bar.addStretch()
-        right_layout.addLayout(status_bar)
 
         # Group 4: Log console
         grp_logs = QGroupBox("实时日志输出 (Live Logs)")
@@ -712,19 +820,22 @@ class VertexProxyApp(QMainWindow):
         self.btn_log_options.setObjectName("btn_log_options")
         self.log_menu = QMenu(self)
         
-        self.act_no_log = QAction("不输出Request和Response", self)
+        self.act_no_log = QAction("不输出", self)
         self.act_full_log = QAction("全量输出Request和Response", self)
         self.act_messages_log = QAction("只输出Request的body部分（messages）", self)
+        self.act_errors_log = QAction("只输出Response错误（content_filter）", self)
         
         self.log_menu.addAction(self.act_no_log)
         self.log_menu.addAction(self.act_full_log)
         self.log_menu.addAction(self.act_messages_log)
+        self.log_menu.addAction(self.act_errors_log)
         
         self.btn_log_options.setMenu(self.log_menu)
         
         self.act_no_log.triggered.connect(lambda: self.set_log_mode("none"))
         self.act_full_log.triggered.connect(lambda: self.set_log_mode("full"))
         self.act_messages_log.triggered.connect(lambda: self.set_log_mode("messages"))
+        self.act_errors_log.triggered.connect(lambda: self.set_log_mode("errors"))
         
         logs_actions.addWidget(self.btn_log_options)
 
@@ -807,6 +918,12 @@ class VertexProxyApp(QMainWindow):
             self.chk_use_proxy.setChecked(False)
             self.toggle_proxy_fields(False)
             self.set_log_mode("full")
+            
+            # Populate default models
+            self.cmb_test_model.model().clear()
+            default_models = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-3.1-pro-preview"]
+            for m in default_models:
+                self.cmb_test_model.addItem(m, checked=True)
             return
 
         self.txt_port.setText(str(config.get("port", "10101")))
@@ -827,10 +944,32 @@ class VertexProxyApp(QMainWindow):
         self.txt_http_proxy.setText(config.get("http_proxy", ""))
         self.txt_https_proxy.setText(config.get("https_proxy", ""))
 
+        all_models = config.get("all_models", [
+            "gemini-3.1-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash",
+            "gemini-3-flash-preview",
+        ])
+        selected_models = config.get("selected_models", [
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+        ])
+        self.cmb_test_model.model().clear()
+        for m in all_models:
+            self.cmb_test_model.addItem(m, checked=(m in selected_models))
+
         log_mode = config.get("log_mode", "full")
         self.set_log_mode(log_mode)
 
     def save_current_settings(self):
+        all_models = []
+        for i in range(self.cmb_test_model.model().rowCount()):
+            item = self.cmb_test_model.model().item(i)
+            if item:
+                all_models.append(item.text())
+        
         config = {
             "port": int(self.txt_port.text().strip() or "10101"),
             "api_key": self.txt_api_key.text().strip(),
@@ -841,6 +980,8 @@ class VertexProxyApp(QMainWindow):
             "http_proxy": self.txt_http_proxy.text().strip(),
             "https_proxy": self.txt_https_proxy.text().strip(),
             "log_mode": getattr(self, "_log_mode", "full"),
+            "all_models": all_models,
+            "selected_models": self.cmb_test_model.checked_items(),
         }
         save_config(config)
 
@@ -851,45 +992,33 @@ class VertexProxyApp(QMainWindow):
             self.btn_log_options.setText("日志选项: 不输出")
         elif mode == "messages":
             self.btn_log_options.setText("日志选项: messages部分")
+        elif mode == "errors":
+            self.btn_log_options.setText("日志选项: Response错误")
         else:
             self.btn_log_options.setText("日志选项: 全量输出")
-        # Save config only after attributes are set to prevent infinite recursion
-        config = {
-            "port": int(self.txt_port.text().strip() or "10101"),
-            "api_key": self.txt_api_key.text().strip(),
-            "project": self.txt_project.text().strip(),
-            "location": self.cmb_location.currentText().strip(),
-            "creds_path": self.txt_creds_path.text().strip(),
-            "use_proxy": self.chk_use_proxy.isChecked(),
-            "http_proxy": self.txt_http_proxy.text().strip(),
-            "https_proxy": self.txt_https_proxy.text().strip(),
-            "log_mode": mode,
-        }
-        save_config(config)
+        self.save_current_settings()
 
     def test_connectivity(self):
         self.save_current_settings()
         
         project = self.txt_project.text().strip()
         location = self.cmb_location.currentText().strip()
-        model = self.cmb_test_model.currentText().strip()
         
         # Locate ADC
         configured_path = self.txt_creds_path.text().strip() or None
         exists, creds_path = locate_adc_file(configured_path)
         
         if not exists:
-            QMessageBox.warning(self, "测试失败", "未找到本地 ADC 凭据，请提供有效的服务账号密钥文件或配置。")
+            QMessageBox.warning(self, "获取模型失败", "未找到本地 ADC 凭据，请提供有效的服务账号密钥文件或配置。")
             return
 
         self.btn_test_conn.setEnabled(False)
-        self.btn_test_conn.setText("测试中...")
-        self.append_log(f"系统消息 - 启动网络连通性测试 (目标模型: {model})...\n")
+        self.btn_test_conn.setText("获取中...")
+        self.append_log("系统消息 - 启动 Vertex AI 模型列表获取...\n")
 
-        self.test_thread = ConnectionTestThread(
+        self.test_thread = FetchModelsThread(
             project=project,
             location=location,
-            model=model,
             creds_path=creds_path,
             use_proxy=self.chk_use_proxy.isChecked(),
             http_proxy=self.txt_http_proxy.text().strip(),
@@ -898,18 +1027,41 @@ class VertexProxyApp(QMainWindow):
         self.test_thread.finished.connect(self.on_test_finished)
         self.test_thread.start()
 
-    def on_test_finished(self, success: bool, message: str):
+    def on_test_finished(self, success: bool, models_list: list, error_message: str):
         self.btn_test_conn.setEnabled(True)
-        self.btn_test_conn.setText("测试连接")
+        self.btn_test_conn.setText("获取模型")
         
         if success:
-            QMessageBox.information(self, "连接测试成功", message)
-            self.append_log("系统消息 - 连通性测试：成功。\n")
+            if not models_list:
+                QMessageBox.warning(self, "获取模型成功", "连接成功，但未发现任何 Gemini 模型。请检查权限或区域。")
+                self.append_log("系统消息 - 获取模型：成功。但未发现任何 Gemini 模型。\n")
+                return
+
+            # Keep currently checked models
+            currently_checked = self.cmb_test_model.checked_items()
+            
+            # Clear and rebuild
+            self.cmb_test_model.model().clear()
+            for m in models_list:
+                # If nothing was selected before, check all retrieved ones by default;
+                # otherwise, preserve the previously checked status.
+                is_checked = (m in currently_checked) or (not currently_checked)
+                self.cmb_test_model.addItem(m, checked=is_checked)
+                
+            QMessageBox.information(self, "获取模型成功", f"连接成功，共发现 {len(models_list)} 个模型")
+            self.append_log(f"系统消息 - 获取模型：成功。共发现 {len(models_list)} 个 Gemini 模型。\n")
+            self.save_current_settings()
         else:
-            QMessageBox.critical(self, "连接测试失败", message)
-            self.append_log(f"系统消息 - 连通性测试：失败。详情:\n{message}\n")
+            QMessageBox.critical(self, "获取模型失败", error_message)
+            self.append_log(f"系统消息 - 获取模型：失败。详情:\n{error_message}\n")
         
         self.update_adc_status()
+
+    def toggle_proxy_action(self):
+        if self.server_thread and self.server_thread.isRunning():
+            self.stop_proxy()
+        else:
+            self.start_proxy()
 
     def start_proxy(self):
         self.save_current_settings()
@@ -931,15 +1083,19 @@ class VertexProxyApp(QMainWindow):
         project = self.txt_project.text().strip()
         location = self.cmb_location.currentText().strip()
         
-        # Standard models configuration returned for /v1/models (from user configuration or default)
-        models = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.1-pro-preview"
+        # Get selected models from the dynamic list
+        selected_models_list = self.cmb_test_model.checked_items()
+        if selected_models_list:
+            models = ",".join(selected_models_list)
+        else:
+            models = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.1-pro-preview"
         
         # Default timeouts
         connect_timeout = 10.0
         read_timeout = 300.0
 
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self.btn_toggle_proxy.setEnabled(False)
+        self.btn_toggle_proxy.setText("正在启动...")
         self.toggle_inputs(False)
 
         self.append_log(f"系统消息 - 正在启动本地代理服务器 (端口: {port})...\n")
@@ -962,6 +1118,8 @@ class VertexProxyApp(QMainWindow):
 
     def stop_proxy(self):
         if self.server_thread and self.server_thread.isRunning():
+            self.btn_toggle_proxy.setEnabled(False)
+            self.btn_toggle_proxy.setText("正在停止...")
             self.append_log("系统消息 - 正在停止代理服务器...\n")
             self.server_thread.stop()
             # Wait for thread to finish
@@ -971,24 +1129,31 @@ class VertexProxyApp(QMainWindow):
         if status == "running":
             self.lbl_server_status.setText("运行中")
             self.lbl_server_status.setStyleSheet("color: #107c10; font-weight: bold;")
-            self.btn_start.setEnabled(False)
-            self.btn_stop.setEnabled(True)
-            self.btn_stop.setObjectName("btn_stop")
-            self.btn_stop.setStyleSheet("") # Apply standard QSS stop style
+            self.btn_toggle_proxy.setEnabled(True)
+            self.btn_toggle_proxy.setText(" 停止代理 ")
+            self.btn_toggle_proxy.setObjectName("btn_stop")
+            self.btn_toggle_proxy.style().unpolish(self.btn_toggle_proxy)
+            self.btn_toggle_proxy.style().polish(self.btn_toggle_proxy)
             self.toggle_inputs(False)
             self.show_tray_message("代理服务器已启动", f"监听地址: http://127.0.0.1:{self.txt_port.text().strip()}")
         elif status == "stopped":
             self.lbl_server_status.setText("已停止")
             self.lbl_server_status.setStyleSheet("color: #888888; font-weight: bold;")
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
+            self.btn_toggle_proxy.setEnabled(True)
+            self.btn_toggle_proxy.setText(" 启动代理 ")
+            self.btn_toggle_proxy.setObjectName("btn_start")
+            self.btn_toggle_proxy.style().unpolish(self.btn_toggle_proxy)
+            self.btn_toggle_proxy.style().polish(self.btn_toggle_proxy)
             self.toggle_inputs(True)
             self.show_tray_message("代理服务器已停止", "本地反向代理服务已经关闭")
         elif status == "error":
             self.lbl_server_status.setText("发生错误")
             self.lbl_server_status.setStyleSheet("color: #d83b01; font-weight: bold;")
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
+            self.btn_toggle_proxy.setEnabled(True)
+            self.btn_toggle_proxy.setText(" 启动代理 ")
+            self.btn_toggle_proxy.setObjectName("btn_start")
+            self.btn_toggle_proxy.style().unpolish(self.btn_toggle_proxy)
+            self.btn_toggle_proxy.style().polish(self.btn_toggle_proxy)
             self.toggle_inputs(True)
             self.append_log(f"错误 - {detail}\n")
             QMessageBox.critical(self, "服务器错误", f"运行服务时遭遇异常:\n{detail}")
