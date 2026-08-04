@@ -855,7 +855,7 @@ class VertexProxyApp(QMainWindow):
         self.act_no_log = QAction("不输出", self)
         self.act_full_log = QAction("全量输出Request和Response", self)
         self.act_messages_log = QAction("只输出Request的body部分（messages）", self)
-        self.act_errors_log = QAction("只输出Response错误（content_filter）", self)
+        self.act_errors_log = QAction("只输出Response错误", self)
         
         self.log_menu.addAction(self.act_no_log)
         self.log_menu.addAction(self.act_full_log)

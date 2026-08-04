@@ -347,7 +347,7 @@ def create_app(
                 request.method,
                 request.url,
             )
-            if log_mode == "full":
+            if log_mode in {"full", "errors"}:
                 LOGGER.info(
                     "[%s] Completed response: Status 401 | Body: Invalid proxy API key",
                     req_id,
@@ -435,7 +435,7 @@ def create_app(
                 response = await client.send(upstream_request, stream=True)
         except Exception as exc:
             LOGGER.warning("Vertex upstream request failed: %s", exc.__class__.__name__)
-            if log_mode == "full":
+            if log_mode in {"full", "errors"}:
                 LOGGER.info(
                     "[%s] Completed response: Status 502 | Body: Vertex upstream unavailable",
                     req_id,
@@ -446,7 +446,7 @@ def create_app(
             await response.aclose()
             err_msg = f"The requested URL '{request.url.path}' was not found on this server."
             LOGGER.warning("[%s] Upstream 404 Not Found (HTML) for %s %s", req_id, request.method, request.url.path)
-            if log_mode == "full":
+            if log_mode in {"full", "errors"}:
                 LOGGER.info(
                     "[%s] Completed response: Status 404 | Body: %s",
                     req_id,
@@ -476,8 +476,8 @@ def create_app(
                     except Exception:
                         resp_body_str = "<binary or undecodable response>"
                     
-                    is_cf_error = "content_filter" in resp_body_str
-                    if log_mode == "full" or (log_mode == "errors" and is_cf_error):
+                    is_error = response.status_code != 200 or "content_filter" in resp_body_str
+                    if log_mode == "full" or (log_mode == "errors" and is_error):
                         resp_headers = dict(_response_headers(response))
                         LOGGER.info(
                             "[%s] Completed response: Status %s | Headers: %s | Body: %s",

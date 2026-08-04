@@ -290,6 +290,31 @@ def test_request_response_logging(caplog) -> None:
     assert len(err2_completed) == 1
     assert "content_filter" in err2_completed[0]
 
+    # 4.3 A non-200 HTTP status response (e.g., 500 error)
+    async def status_500_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            headers={"content-type": "application/json"},
+            stream=AsyncBytes(b'{"error":{"message":"Internal error","type":"server_error"}}'),
+        )
+    app_500 = create_app(
+        settings,
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(status_500_handler),
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="vertex_proxy"):
+        with TestClient(app_500) as client:
+            client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer local-secret"},
+                json={"model": "gemini-2.5-flash"},
+            )
+    log_records_err3 = [rec.message for rec in caplog.records if rec.name == "vertex_proxy"]
+    err3_completed = [log for log in log_records_err3 if "Completed response" in log]
+    assert len(err3_completed) == 1
+    assert "Status 500" in err3_completed[0]
+
 
 def test_get_single_model() -> None:
     credentials = FakeCredentials()
