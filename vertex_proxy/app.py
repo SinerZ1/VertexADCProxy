@@ -287,6 +287,10 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @application.get("/v1/healthz")
+    async def openai_health() -> dict[str, str]:
+        return {"status": "ok"}
+
     @application.get("/v1/models")
     async def list_models(request: Request):
         config: Settings = request.app.state.settings
@@ -299,6 +303,34 @@ def create_app(
                 {"id": model, "object": "model", "created": now, "owned_by": "google"}
                 for model in config.models
             ],
+        }
+
+    @application.get("/v1/models/{model_id:path}")
+    async def get_model(request: Request, model_id: str):
+        config: Settings = request.app.state.settings
+        if not _authorized(request, config.proxy_api_key):
+            return _error(401, "Invalid proxy API key", "authentication_error")
+
+        requested_norm = model_id.removeprefix("google/")
+        if config.models:
+            matched = None
+            for m in config.models:
+                m_norm = m.removeprefix("google/")
+                if m == model_id or m_norm == requested_norm:
+                    matched = m
+                    break
+            if not matched:
+                return _error(404, f"Model '{model_id}' not found", "invalid_request_error")
+            target_id = matched
+        else:
+            target_id = model_id
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        return {
+            "id": target_id,
+            "object": "model",
+            "created": now,
+            "owned_by": "google",
         }
 
     async def proxy(request: Request, upstream_url: str):
@@ -409,6 +441,18 @@ def create_app(
                     req_id,
                 )
             return _error(502, "Vertex upstream unavailable", "upstream_error")
+
+        if response.status_code == 404 and "html" in response.headers.get("content-type", "").lower():
+            await response.aclose()
+            err_msg = f"The requested URL '{request.url.path}' was not found on this server."
+            LOGGER.warning("[%s] Upstream 404 Not Found (HTML) for %s %s", req_id, request.method, request.url.path)
+            if log_mode == "full":
+                LOGGER.info(
+                    "[%s] Completed response: Status 404 | Body: %s",
+                    req_id,
+                    _format_json(f'{{"error": {{"message": "{err_msg}", "type": "invalid_request_error"}}}}'),
+                )
+            return _error(404, err_msg, "invalid_request_error")
 
         async def logged_stream_generator():
             accumulated_chunks = []

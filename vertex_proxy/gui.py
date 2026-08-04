@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QTextEdit, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu, QStyle, QListView
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, QEvent, Qt
-from PyQt6.QtGui import QAction, QIntValidator, QStandardItemModel, QStandardItem
+from PyQt6.QtGui import QAction, QIcon, QIntValidator, QStandardItemModel, QStandardItem
 
 # Logger setup
 LOGGER = logging.getLogger("vertex_proxy_gui")
@@ -24,6 +24,34 @@ _ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 def strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub('', text)
+
+
+def get_resource_path(relative_path: str) -> str:
+    """Gets absolute path to resource file, supporting PyInstaller bundle and dev mode."""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(getattr(sys, '_MEIPASS'), relative_path)
+    p = Path(relative_path)
+    if p.exists():
+        return str(p.resolve())
+    p_parent = Path(__file__).parent.parent / relative_path
+    if p_parent.exists():
+        return str(p_parent.resolve())
+    return relative_path
+
+
+def get_app_icon_path() -> str:
+    """Gets the best icon file path (PNG or ICO)."""
+    ico_path = get_resource_path("icon.ico")
+    png_path = get_resource_path("Vertex Proxy.png")
+    
+    if os.path.exists(png_path) and os.path.exists(ico_path):
+        if os.path.getmtime(png_path) > os.path.getmtime(ico_path):
+            return png_path
+    if os.path.exists(ico_path):
+        return ico_path
+    if os.path.exists(png_path):
+        return png_path
+    return ""
 
 
 class CheckableComboBox(QComboBox):
@@ -623,8 +651,12 @@ class VertexProxyApp(QMainWindow):
         self.setMinimumWidth(1350)
         self.setStyleSheet(DARK_STYLE)
 
-        # Set Window icon using standard system icons to avoid missing external file
-        self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        # Set Window icon
+        icon_file = get_app_icon_path()
+        if icon_file:
+            self.setWindowIcon(QIcon(icon_file))
+        else:
+            self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
 
         # Main Widget and Layout
         main_widget = QWidget()
@@ -1182,7 +1214,11 @@ class VertexProxyApp(QMainWindow):
     # Tray Integration
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        icon_file = get_app_icon_path()
+        if icon_file:
+            self.tray_icon.setIcon(QIcon(icon_file))
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
         
         tray_menu = QMenu()
         show_action = QAction("显示主界面", self)

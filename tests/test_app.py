@@ -289,3 +289,73 @@ def test_request_response_logging(caplog) -> None:
     err2_completed = [log for log in log_records_err2 if "Completed response" in log]
     assert len(err2_completed) == 1
     assert "content_filter" in err2_completed[0]
+
+
+def test_get_single_model() -> None:
+    credentials = FakeCredentials()
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        models=("google/gemini-3.6-flash", "google/gemini-2.5-pro"),
+    )
+    app = create_app(settings, credentials=credentials)
+
+    with TestClient(app) as client:
+        # Test getting configured model without google/ prefix
+        res = client.get("/v1/models/gemini-3.6-flash")
+        assert res.status_code == 200
+        data = res.json()
+        assert data["id"] == "google/gemini-3.6-flash"
+        assert data["object"] == "model"
+        assert data["owned_by"] == "google"
+
+        # Test getting configured model with google/ prefix
+        res2 = client.get("/v1/models/google/gemini-3.6-flash")
+        assert res2.status_code == 200
+        assert res2.json()["id"] == "google/gemini-3.6-flash"
+
+        # Test getting non-configured model when models setting is populated
+        res3 = client.get("/v1/models/unknown-model")
+        assert res3.status_code == 404
+        assert "Model 'unknown-model' not found" in res3.json()["error"]["message"]
+
+    # Test when models setting is empty (all model IDs allowed)
+    settings_empty = Settings(project="sample-project", location="us-central1")
+    app_empty = create_app(settings_empty, credentials=credentials)
+    with TestClient(app_empty) as client:
+        res4 = client.get("/v1/models/gemini-3.6-flash")
+        assert res4.status_code == 200
+        assert res4.json()["id"] == "gemini-3.6-flash"
+
+
+def test_upstream_html_404_converted_to_json() -> None:
+    credentials = FakeCredentials()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        html_body = b"<!DOCTYPE html><html><body>Error 404</body></html>"
+        return httpx.Response(
+            404,
+            headers={"content-type": "text/html; charset=UTF-8"},
+            stream=AsyncBytes(html_body),
+        )
+
+    app = create_app(
+        Settings(project="sample-project", location="us-central1"),
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        res = client.get("/v1/props")
+        assert res.status_code == 404
+        assert res.headers["content-type"] == "application/json"
+        data = res.json()
+        assert "error" in data
+        assert "The requested URL '/v1/props' was not found" in data["error"]["message"]
+
+
+def test_health_endpoints() -> None:
+    app = create_app(Settings(project="sample-project", location="us-central1"))
+    with TestClient(app) as client:
+        assert client.get("/healthz").json() == {"status": "ok"}
+        assert client.get("/v1/healthz").json() == {"status": "ok"}
