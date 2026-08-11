@@ -831,11 +831,13 @@ class GeminiAnthropicAdapter:
         response: httpx.Response,
         headers: Mapping[str, str],
     ) -> dict[str, str]:
-        result = dict(headers)
+        drop_keys = {"content-length", "content-encoding", "transfer-encoding", "content-type"}
+        result = {k: v for k, v in headers.items() if k.lower() not in drop_keys}
         if response.status_code >= 400:
+            result["content-type"] = (
+                headers.get("content-type") or headers.get("Content-Type") or "application/json"
+            )
             return result
-        for name in ("content-length", "content-encoding", "transfer-encoding"):
-            result.pop(name, None)
         result["content-type"] = (
             "text/event-stream; charset=utf-8"
             if self.stream
@@ -892,11 +894,14 @@ class GeminiCountTokensAdapter:
         response: httpx.Response,
         headers: Mapping[str, str],
     ) -> dict[str, str]:
-        result = dict(headers)
-        if response.status_code < 400:
-            for name in ("content-length", "content-encoding", "transfer-encoding"):
-                result.pop(name, None)
-            result["content-type"] = "application/json; charset=utf-8"
+        drop_keys = {"content-length", "content-encoding", "transfer-encoding", "content-type"}
+        result = {k: v for k, v in headers.items() if k.lower() not in drop_keys}
+        if response.status_code >= 400:
+            result["content-type"] = (
+                headers.get("content-type") or headers.get("Content-Type") or "application/json"
+            )
+            return result
+        result["content-type"] = "application/json; charset=utf-8"
         return result
 
     async def transform(self, response: httpx.Response) -> AsyncIterator[bytes]:

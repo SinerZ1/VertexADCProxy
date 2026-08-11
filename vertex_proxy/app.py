@@ -632,7 +632,7 @@ def create_app(
                     
                     is_error = response.status_code != 200 or "content_filter" in resp_body_str
                     if log_mode == "full" or (log_mode == "errors" and is_error):
-                        resp_headers = dict(_response_headers(response))
+                        resp_headers = dict(response_headers)
                         LOGGER.info(
                             "[%s] Completed response: Status %s | Headers: %s | Body: %s",
                             req_id,

@@ -247,10 +247,11 @@ def chat_completions_to_responses(
             {
                 "id": f"msg_{secrets.token_hex(12)}",
                 "type": "message",
+                "status": "completed",
                 "role": "assistant",
                 "content": [
                     {
-                        "type": "text",
+                        "type": "output_text",
                         "text": text,
                     }
                 ],
@@ -270,6 +271,7 @@ def chat_completions_to_responses(
                 {
                     "id": call_id,
                     "type": "function_call",
+                    "status": "completed",
                     "call_id": call_id,
                     "name": func.get("name", ""),
                     "arguments": func.get("arguments", "{}"),
@@ -285,6 +287,7 @@ def chat_completions_to_responses(
         "id": response_id,
         "object": "response",
         "created_at": created_at,
+        "completed_at": created_at,
         "status": status,
         "model": client_model,
         "output": output,
@@ -338,19 +341,34 @@ async def _stream_chat_completions_as_responses(
     response_id = f"resp_{secrets.token_hex(12)}"
     created_at = int(datetime.now(timezone.utc).timestamp())
 
+    resp_obj = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "completed_at": None,
+        "status": "in_progress",
+        "model": client_model,
+        "output": [],
+        "error": None,
+        "tools": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "usage": None,
+    }
+
     yield _sse(
         "response.created",
         {
             "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": created_at,
-                "status": "in_progress",
-                "model": client_model,
-                "output": [],
-                "usage": None,
-            },
+            "response": resp_obj,
+        },
+    )
+
+    yield _sse(
+        "response.in_progress",
+        {
+            "type": "response.in_progress",
+            "response": resp_obj,
         },
     )
 
@@ -403,11 +421,11 @@ async def _stream_chat_completions_as_responses(
                     "response.output_item.added",
                     {
                         "type": "response.output_item.added",
-                        "response_id": response_id,
                         "output_index": text_output_index,
                         "item": {
                             "id": msg_id,
                             "type": "message",
+                            "status": "in_progress",
                             "role": "assistant",
                             "content": [],
                         },
@@ -417,22 +435,28 @@ async def _stream_chat_completions_as_responses(
                     "response.content_part.added",
                     {
                         "type": "response.content_part.added",
-                        "response_id": response_id,
+                        "item_id": msg_id,
                         "output_index": text_output_index,
                         "content_index": 0,
-                        "part": {"type": "text", "text": ""},
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                            "logprobs": [],
+                        },
                     },
                 )
 
             accumulated_text += text_delta
             yield _sse(
-                "response.text.delta",
+                "response.output_text.delta",
                 {
-                    "type": "response.text.delta",
-                    "response_id": response_id,
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
                     "output_index": text_output_index,
                     "content_index": 0,
                     "delta": text_delta,
+                    "logprobs": [],
                 },
             )
 
@@ -469,11 +493,11 @@ async def _stream_chat_completions_as_responses(
                             "response.output_item.added",
                             {
                                 "type": "response.output_item.added",
-                                "response_id": response_id,
                                 "output_index": entry["output_index"],
                                 "item": {
                                     "id": call_id,
                                     "type": "function_call",
+                                    "status": "in_progress",
                                     "call_id": call_id,
                                     "name": entry["name"],
                                     "arguments": "",
@@ -487,7 +511,7 @@ async def _stream_chat_completions_as_responses(
                             "response.function_call_arguments.delta",
                             {
                                 "type": "response.function_call_arguments.delta",
-                                "response_id": response_id,
+                                "item_id": entry["id"],
                                 "output_index": entry["output_index"],
                                 "call_id": entry["id"],
                                 "delta": args_delta,
@@ -498,36 +522,49 @@ async def _stream_chat_completions_as_responses(
 
     if text_started:
         yield _sse(
-            "response.text.done",
+            "response.output_text.done",
             {
-                "type": "response.text.done",
-                "response_id": response_id,
+                "type": "response.output_text.done",
+                "item_id": msg_id,
                 "output_index": text_output_index,
                 "content_index": 0,
                 "text": accumulated_text,
+                "logprobs": [],
             },
         )
         yield _sse(
             "response.content_part.done",
             {
                 "type": "response.content_part.done",
-                "response_id": response_id,
+                "item_id": msg_id,
                 "output_index": text_output_index,
                 "content_index": 0,
-                "part": {"type": "text", "text": accumulated_text},
+                "part": {
+                    "type": "output_text",
+                    "text": accumulated_text,
+                    "annotations": [],
+                    "logprobs": [],
+                },
             },
         )
         msg_item = {
             "id": msg_id,
             "type": "message",
+            "status": "completed",
             "role": "assistant",
-            "content": [{"type": "text", "text": accumulated_text}],
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": accumulated_text,
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
         }
         yield _sse(
             "response.output_item.done",
             {
                 "type": "response.output_item.done",
-                "response_id": response_id,
                 "output_index": text_output_index,
                 "item": msg_item,
             },
@@ -540,7 +577,7 @@ async def _stream_chat_completions_as_responses(
                 "response.function_call_arguments.done",
                 {
                     "type": "response.function_call_arguments.done",
-                    "response_id": response_id,
+                    "item_id": entry["id"],
                     "output_index": entry["output_index"],
                     "call_id": entry["id"],
                     "arguments": entry["arguments"],
@@ -549,6 +586,7 @@ async def _stream_chat_completions_as_responses(
             fn_item = {
                 "id": entry["id"],
                 "type": "function_call",
+                "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
                 "arguments": entry["arguments"],
@@ -557,7 +595,6 @@ async def _stream_chat_completions_as_responses(
                 "response.output_item.done",
                 {
                     "type": "response.output_item.done",
-                    "response_id": response_id,
                     "output_index": entry["output_index"],
                     "item": fn_item,
                 },
@@ -572,6 +609,7 @@ async def _stream_chat_completions_as_responses(
         else input_tokens + output_tokens
     )
 
+    completed_at = int(datetime.now(timezone.utc).timestamp())
     yield _sse(
         "response.completed",
         {
@@ -580,6 +618,7 @@ async def _stream_chat_completions_as_responses(
                 "id": response_id,
                 "object": "response",
                 "created_at": created_at,
+                "completed_at": completed_at,
                 "status": "completed",
                 "model": client_model,
                 "output": final_output,
@@ -624,11 +663,13 @@ class OpenAIResponsesAdapter:
         response: httpx.Response,
         headers: Mapping[str, str],
     ) -> dict[str, str]:
-        result = dict(headers)
+        drop_keys = {"content-length", "content-encoding", "transfer-encoding", "content-type"}
+        result = {k: v for k, v in headers.items() if k.lower() not in drop_keys}
         if response.status_code >= 400:
+            result["content-type"] = (
+                headers.get("content-type") or headers.get("Content-Type") or "application/json"
+            )
             return result
-        for name in ("content-length", "content-encoding", "transfer-encoding"):
-            result.pop(name, None)
         result["content-type"] = (
             "text/event-stream; charset=utf-8"
             if self.stream

@@ -399,6 +399,49 @@ def test_anthropic_gemini_count_tokens_uses_native_api() -> None:
     )
 
 
+def test_anthropic_gemini_headers_cleanup() -> None:
+    import gzip
+    credentials = FakeCredentials()
+    raw_data = b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
+    compressed_data = gzip.compress(raw_data)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+                "Content-Length": str(len(compressed_data)),
+            },
+            stream=AsyncBytes(compressed_data),
+        )
+
+    app = create_app(
+        Settings(
+            project="sample-project",
+            location="global",
+            models=("gemini-2.5-flash",),
+        ),
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-2.5-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+    assert res.status_code == 200
+    assert "content-encoding" not in res.headers
+    assert res.headers.get("content-length") != str(len(compressed_data))
+    assert res.headers["content-type"] == "text/event-stream; charset=utf-8"
+
+
+
 def test_list_models_includes_gemini_and_claude_aliases() -> None:
     credentials = FakeCredentials()
     settings = Settings(

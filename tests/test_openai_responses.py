@@ -235,11 +235,62 @@ def test_openai_responses_streaming() -> None:
     body = res.text
 
     assert "event: response.created" in body
+    assert "event: response.in_progress" in body
     assert "event: response.output_item.added" in body
-    assert "event: response.text.delta" in body
+    assert "event: response.output_text.delta" in body
     assert '"delta":"Hello "' in body
     assert '"delta":"world!"' in body
     assert "event: response.function_call_arguments.delta" in body
-    assert "event: response.text.done" in body
+    assert "event: response.output_text.done" in body
     assert "event: response.completed" in body
     assert "data: [DONE]" in body
+
+
+def test_openai_responses_headers_cleanup() -> None:
+    import gzip
+    credentials = FakeCredentials()
+    raw_data = (
+        b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    compressed_data = gzip.compress(raw_data)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Content-Encoding": "gzip",
+                "Content-Length": str(len(compressed_data)),
+            },
+            stream=AsyncBytes(compressed_data),
+        )
+
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        proxy_api_key="local-secret",
+    )
+    app = create_app(
+        settings,
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer local-secret"},
+            json={
+                "model": "gemini-2.5-flash",
+                "input": "Hi",
+                "stream": True,
+            },
+        )
+
+    assert res.status_code == 200
+    assert "content-encoding" not in res.headers
+    assert res.headers.get("content-length") != str(len(compressed_data))
+    assert res.headers["content-type"] == "text/event-stream; charset=utf-8"
+    assert "event: response.created" in res.text
+
