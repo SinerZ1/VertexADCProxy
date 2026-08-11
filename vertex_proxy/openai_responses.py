@@ -47,6 +47,46 @@ def _normalize_tool_choice(choice: Any) -> Any:
     return choice
 
 
+def _normalize_input_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+
+    normalized: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "input_text":
+            text = block.get("text", "")
+            normalized.append({"type": "text", "text": text})
+        elif block_type == "input_image":
+            image_url = block.get("image_url")
+            if isinstance(image_url, dict):
+                normalized.append({"type": "image_url", "image_url": image_url})
+            elif isinstance(block.get("source"), dict):
+                src = block["source"]
+                if src.get("type") == "base64":
+                    media_type = src.get("media_type", "image/png")
+                    data = src.get("data", "")
+                    normalized.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{data}"},
+                    })
+                elif src.get("type") == "url":
+                    normalized.append({
+                        "type": "image_url",
+                        "image_url": {"url": src.get("url", "")},
+                    })
+        else:
+            normalized.append(block)
+
+    if all(b.get("type") == "text" for b in normalized if isinstance(b, dict)):
+        return "".join(b.get("text", "") for b in normalized if isinstance(b, dict))
+    return normalized
+
+
 def responses_to_chat_completions(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     client_model = payload.get("model")
     if not isinstance(client_model, str) or not client_model.strip():
@@ -71,7 +111,7 @@ def responses_to_chat_completions(payload: Mapping[str, Any]) -> tuple[str, dict
             elif isinstance(item, dict):
                 item_type = item.get("type")
                 if "role" in item:
-                    msg = {"role": item["role"], "content": item.get("content")}
+                    msg = {"role": item["role"], "content": _normalize_input_content(item.get("content"))}
                     if "tool_calls" in item:
                         msg["tool_calls"] = item["tool_calls"]
                     messages.append(msg)
@@ -79,7 +119,7 @@ def responses_to_chat_completions(payload: Mapping[str, Any]) -> tuple[str, dict
                     messages.append(
                         {
                             "role": item.get("role", "user"),
-                            "content": item.get("content"),
+                            "content": _normalize_input_content(item.get("content")),
                         }
                     )
                 elif item_type == "function_call":
@@ -124,7 +164,10 @@ def responses_to_chat_completions(payload: Mapping[str, Any]) -> tuple[str, dict
     if isinstance(payload.get("messages"), list):
         for msg in payload["messages"]:
             if isinstance(msg, dict) and "role" in msg:
-                messages.append(msg)
+                m = dict(msg)
+                if "content" in m:
+                    m["content"] = _normalize_input_content(m["content"])
+                messages.append(m)
 
     converted: dict[str, Any] = {
         "model": model,

@@ -122,7 +122,76 @@ def test_openai_responses_non_streaming() -> None:
     }
 
 
+def test_openai_responses_input_text_normalization() -> None:
+    credentials = FakeCredentials()
+    seen_requests: list[httpx.Request] = []
+
+    chat_completion_response = {
+        "id": "chatcmpl-888",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "google/gemini-2.5-flash",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Normalized input response",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=AsyncBytes(json.dumps(chat_completion_response).encode("utf-8")),
+        )
+
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        proxy_api_key="local-secret",
+    )
+    app = create_app(
+        settings,
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer local-secret"},
+            json={
+                "model": "gemini-2.5-flash",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Hello world with input_text"}
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert res.status_code == 200
+    assert len(seen_requests) == 1
+    upstream_body = json.loads(seen_requests[0].content)
+    assert upstream_body["messages"][0] == {
+        "role": "user",
+        "content": "Hello world with input_text",
+    }
+
+
 def test_openai_responses_streaming() -> None:
+
     credentials = FakeCredentials()
     upstream_chunks = (
         b'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',
