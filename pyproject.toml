@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vertex-adc-proxy"
-version = "1.0.0"
-description = "Streaming OpenAI-compatible reverse proxy for Vertex AI using ADC"
+version = "1.2.0"
+description = "Streaming OpenAI and Anthropic-compatible reverse proxy for Vertex AI using ADC"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.115,<1",

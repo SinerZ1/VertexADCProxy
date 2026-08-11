@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -8,20 +9,34 @@ import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Mapping
+from typing import Any, Callable, Mapping
 
 import google.auth
 import httpx
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from starlette.background import BackgroundTask
 
+from vertex_proxy.anthropic_gemini import GeminiAnthropicAdapter, GeminiCountTokensAdapter
+
 LOGGER = logging.getLogger("vertex_proxy")
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 _SAFE_RESOURCE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+_SAFE_ANTHROPIC_MODEL = re.compile(r"^[a-z0-9][a-z0-9._@-]{0,127}$")
+_DATED_ANTHROPIC_MODEL = re.compile(r"^(?P<name>claude-[a-z0-9.-]+)-(?P<date>[0-9]{8})$")
+_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
+_DEFAULT_ANTHROPIC_MODEL_MAP = {
+    # Anthropic API IDs whose current Google Cloud model IDs also reorder a
+    # family/version segment. Other dated Anthropic IDs simply drop the date.
+    "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-v2",
+    "claude-4-sonnet-20250514": "claude-sonnet-4",
+    "claude-4-5-sonnet-20250929": "claude-sonnet-4-5",
+    "claude-4-5-haiku-20251001": "claude-haiku-4-5",
+    "claude-4-5-opus-20251101": "claude-opus-4-5",
+}
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -53,12 +68,34 @@ def _positive_float(value: str, name: str, *, allow_zero: bool = False) -> float
     return parsed
 
 
+def _anthropic_model_map(value: str) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    for raw_pair in value.split(","):
+        raw_pair = raw_pair.strip()
+        if not raw_pair:
+            continue
+        source, separator, target = raw_pair.partition("=")
+        source = source.strip()
+        target = target.strip()
+        if not separator or not source or not target:
+            raise RuntimeError(
+                "VERTEX_ANTHROPIC_MODEL_MAP 必须使用 client-model=vertex-model 格式"
+            )
+        if not _SAFE_ANTHROPIC_MODEL.fullmatch(target):
+            raise RuntimeError("VERTEX_ANTHROPIC_MODEL_MAP 包含不合法的 Vertex 模型名")
+        pairs.append((source, target))
+    return tuple(pairs)
+
+
 @dataclass(frozen=True)
 class Settings:
     project: str
     location: str
     proxy_api_key: str | None = None
     models: tuple[str, ...] = ()
+    anthropic_model_map: tuple[tuple[str, str], ...] = ()
+    anthropic_backend: str = "claude"
+    anthropic_gemini_model: str = ""
     connect_timeout: float = 10.0
     read_timeout: float | None = 300.0
     token_refresh_skew: float = 300.0
@@ -84,11 +121,21 @@ class Settings:
         )
         raw_models = source.get("VERTEX_MODELS", "")
         models = tuple(dict.fromkeys(item.strip() for item in raw_models.split(",") if item.strip()))
+        anthropic_backend = source.get("VERTEX_ANTHROPIC_BACKEND", "claude").strip().lower()
+        if anthropic_backend not in {"claude", "gemini"}:
+            raise RuntimeError("VERTEX_ANTHROPIC_BACKEND 只能是 claude 或 gemini")
         return cls(
             project=project,
             location=location,
             proxy_api_key=source.get("VERTEX_PROXY_API_KEY") or None,
             models=models,
+            anthropic_model_map=_anthropic_model_map(
+                source.get("VERTEX_ANTHROPIC_MODEL_MAP", "")
+            ),
+            anthropic_backend=anthropic_backend,
+            anthropic_gemini_model=source.get(
+                "VERTEX_ANTHROPIC_GEMINI_MODEL", ""
+            ).strip(),
             connect_timeout=_positive_float(
                 source.get("VERTEX_CONNECT_TIMEOUT", "10"),
                 "VERTEX_CONNECT_TIMEOUT",
@@ -105,6 +152,8 @@ class Settings:
     def upstream_host(self) -> str:
         if self.location == "global":
             return "aiplatform.googleapis.com"
+        if self.location in {"us", "eu"}:
+            return f"aiplatform.{self.location}.rep.googleapis.com"
         return f"{self.location}-aiplatform.googleapis.com"
 
     @property
@@ -118,6 +167,36 @@ class Settings:
         return (
             f"https://{self.upstream_host}/{api_version}/projects/{self.project}"
             f"/locations/{self.location}"
+        )
+
+    def resolve_anthropic_model(self, client_model: str) -> str:
+        configured = dict(_DEFAULT_ANTHROPIC_MODEL_MAP)
+        configured.update(self.anthropic_model_map)
+        if client_model in configured:
+            return configured[client_model]
+
+        dated_match = _DATED_ANTHROPIC_MODEL.fullmatch(client_model)
+        if dated_match:
+            vertex_model = dated_match.group("name")
+        else:
+            vertex_model = client_model
+
+        if not _SAFE_ANTHROPIC_MODEL.fullmatch(vertex_model):
+            raise ValueError("model 必须是合法的 Claude/Vertex 模型 ID")
+        return vertex_model
+
+    def anthropic_model_url(self, model: str, method: str) -> str:
+        return (
+            f"https://{self.upstream_host}/v1/projects/{self.project}"
+            f"/locations/{self.location}/publishers/anthropic/models/{model}:{method}"
+        )
+
+    @property
+    def anthropic_count_tokens_url(self) -> str:
+        return (
+            f"https://{self.upstream_host}/v1/projects/{self.project}"
+            f"/locations/{self.location}/publishers/anthropic/models/"
+            "count-tokens:rawPredict"
         )
 
 
@@ -155,13 +234,14 @@ class AdcTokenProvider:
             return token
 
 
-def _request_headers(request: Request, token: str) -> dict[str, str]:
+def _request_headers(request: Request, token: str | None = None) -> dict[str, str]:
     headers = {
         name: value
         for name, value in request.headers.items()
         if name.lower() not in _REQUEST_HEADERS_TO_DROP
     }
-    headers["authorization"] = f"Bearer {token}"
+    if token is not None:
+        headers["authorization"] = f"Bearer {token}"
     return headers
 
 
@@ -231,6 +311,93 @@ def _adc_credentials() -> Credentials:
     return credentials
 
 
+def _ensure_thought_signatures(data: dict[str, Any]) -> None:
+    """Ensure assistant function calls in conversation history have a thought signature.
+
+    Gemini 2.5 and 3 models enforce thought signatures on function calls in history.
+    If missing, Vertex AI returns a 400 INVALID_ARGUMENT error. Google documents
+    'skip_thought_signature_validator' as the standard fallback value.
+    """
+    dummy_sig = "skip_thought_signature_validator"
+
+    messages = data.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role in {"assistant", "model"}:
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        extra_content = tc.setdefault("extra_content", {})
+                        if isinstance(extra_content, dict):
+                            google_extra = extra_content.setdefault("google", {})
+                            if isinstance(google_extra, dict):
+                                google_extra.setdefault("thought_signature", dummy_sig)
+                        tc.setdefault("thought_signature", dummy_sig)
+                        tc.setdefault("thoughtSignature", dummy_sig)
+                        fn = tc.get("function")
+                        if isinstance(fn, dict):
+                            fn.setdefault("thought_signature", dummy_sig)
+                            fn.setdefault("thoughtSignature", dummy_sig)
+
+                fn_call = msg.get("function_call")
+                if isinstance(fn_call, dict):
+                    fn_call.setdefault("thought_signature", dummy_sig)
+                    fn_call.setdefault("thoughtSignature", dummy_sig)
+
+    contents = data.get("contents")
+    if isinstance(contents, list):
+        for item in contents:
+            if not isinstance(item, dict):
+                continue
+            parts = item.get("parts")
+            if isinstance(parts, list):
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    fc = part.get("functionCall")
+                    if isinstance(fc, dict):
+                        fc.setdefault("thought_signature", dummy_sig)
+                        fc.setdefault("thoughtSignature", dummy_sig)
+                        part.setdefault("thought_signature", dummy_sig)
+                        part.setdefault("thoughtSignature", dummy_sig)
+
+
+def _prepare_anthropic_request(
+    body: bytes,
+    config: Settings,
+    *,
+    count_tokens: bool = False,
+) -> tuple[str, bytes]:
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("请求体必须是有效的 JSON 对象") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+
+    client_model = payload.get("model")
+    if not isinstance(client_model, str) or not client_model.strip():
+        raise ValueError("缺少有效的 model 字段")
+    vertex_model = config.resolve_anthropic_model(client_model.strip())
+
+    if count_tokens:
+        payload["model"] = vertex_model
+        upstream_url = config.anthropic_count_tokens_url
+    else:
+        payload.pop("model", None)
+        payload["anthropic_version"] = _VERTEX_ANTHROPIC_VERSION
+        method = "streamRawPredict" if payload.get("stream") is True else "rawPredict"
+        upstream_url = config.anthropic_model_url(vertex_model, method)
+
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return upstream_url, encoded
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -276,7 +443,7 @@ def create_app(
 
     application = FastAPI(
         title="Vertex AI ADC Proxy",
-        version="1.0.0",
+        version="1.2.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -290,6 +457,10 @@ def create_app(
     @application.get("/v1/healthz")
     async def openai_health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @application.head("/api/hello", status_code=204)
+    async def anthropic_connection_probe() -> Response:
+        return Response(status_code=204)
 
     @application.get("/v1/models")
     async def list_models(request: Request):
@@ -333,7 +504,15 @@ def create_app(
             "owned_by": "google",
         }
 
-    async def proxy(request: Request, upstream_url: str):
+    async def proxy(
+        request: Request,
+        upstream_url: str | None = None,
+        *,
+        prepare: Callable[[bytes, Settings], tuple[str, bytes]] | None = None,
+        response_adapter: Any | None = None,
+        preprocess_openai_model: bool = False,
+        forward_query: bool = True,
+    ):
         req_id = secrets.token_hex(4)
         config: Settings = request.app.state.settings
         log_mode = os.environ.get("VERTEX_PROXY_LOG_MODE", "full")
@@ -354,17 +533,27 @@ def create_app(
                 )
             return _error(401, "Invalid proxy API key", "authentication_error")
 
-        if body and "application/json" in request.headers.get("content-type", "").lower():
+        if prepare is not None:
             try:
-                import json
+                upstream_url, body = prepare(body, config)
+            except ValueError as exc:
+                return _error(400, str(exc), "invalid_request_error")
+        elif (
+            preprocess_openai_model
+            and body
+            and "application/json" in request.headers.get("content-type", "").lower()
+        ):
+            try:
                 data = json.loads(body)
-                if isinstance(data, dict) and "model" in data and isinstance(data["model"], str):
-                    model_name = data["model"]
-                    if "/" not in model_name:
-                        data["model"] = f"google/{model_name}"
-                        body = json.dumps(data).encode("utf-8")
+                if isinstance(data, dict):
+                    if "model" in data and isinstance(data["model"], str):
+                        model_name = data["model"]
+                        if "/" not in model_name:
+                            data["model"] = f"google/{model_name}"
+                    _ensure_thought_signatures(data)
+                    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
             except Exception as exc:
-                LOGGER.warning("Failed to preprocess request body model prefix: %s", exc)
+                LOGGER.warning("Failed to preprocess request body: %s", exc)
 
         req_headers = {}
         for name, value in request.headers.items():
@@ -393,7 +582,6 @@ def create_app(
             messages = None
             if body:
                 try:
-                    import json
                     data = json.loads(body)
                     if isinstance(data, dict) and "messages" in data:
                         messages = data["messages"]
@@ -401,7 +589,6 @@ def create_app(
                     pass
             if messages is not None:
                 try:
-                    import json
                     msg_str = json.dumps(messages, indent=2, ensure_ascii=False)
                 except Exception:
                     msg_str = str(messages)
@@ -411,14 +598,21 @@ def create_app(
 
         client: httpx.AsyncClient = request.app.state.upstream_client
         token_provider: AdcTokenProvider = request.app.state.token_provider
+        if upstream_url is None:
+            return _error(500, "Proxy upstream URL was not prepared", "internal_error")
+
+        upstream_headers = _request_headers(request)
+        if prepare is not None:
+            upstream_headers["content-type"] = "application/json"
 
         try:
             token = await token_provider.token()
+            upstream_headers["authorization"] = f"Bearer {token}"
             upstream_request = client.build_request(
                 request.method,
                 upstream_url,
-                params=request.query_params.multi_items(),
-                headers=_request_headers(request, token),
+                params=request.query_params.multi_items() if forward_query else None,
+                headers=upstream_headers,
                 content=body,
             )
             response = await client.send(upstream_request, stream=True)
@@ -428,8 +622,8 @@ def create_app(
                 upstream_request = client.build_request(
                     request.method,
                     upstream_url,
-                    params=request.query_params.multi_items(),
-                    headers=_request_headers(request, token),
+                    params=request.query_params.multi_items() if forward_query else None,
+                    headers={**upstream_headers, "authorization": f"Bearer {token}"},
                     content=body,
                 )
                 response = await client.send(upstream_request, stream=True)
@@ -454,16 +648,27 @@ def create_app(
                 )
             return _error(404, err_msg, "invalid_request_error")
 
+        response_headers = _response_headers(response)
+        if response_adapter is not None:
+            response_headers = response_adapter.response_headers(response, response_headers)
+
         async def logged_stream_generator():
             accumulated_chunks = []
             try:
-                async for chunk in response.aiter_raw():
+                source = (
+                    response_adapter.transform(response)
+                    if response_adapter is not None
+                    else response.aiter_raw()
+                )
+                async for chunk in source:
                     accumulated_chunks.append(chunk)
                     yield chunk
             finally:
                 if log_mode == "full" or log_mode == "errors":
-                    decompressed_body = _decompress_response(b"".join(accumulated_chunks), response.headers)
-                    content_type = response.headers.get("content-type", "").lower()
+                    decompressed_body = _decompress_response(
+                        b"".join(accumulated_chunks), response_headers
+                    )
+                    content_type = response_headers.get("content-type", "").lower()
                     charset = "utf-8"
                     if "charset=" in content_type:
                         try:
@@ -490,8 +695,46 @@ def create_app(
         return StreamingResponse(
             logged_stream_generator(),
             status_code=response.status_code,
-            headers=_response_headers(response),
+            headers=response_headers,
             background=BackgroundTask(response.aclose),
+        )
+
+    @application.post("/v1/messages")
+    async def anthropic_messages(request: Request):
+        config: Settings = request.app.state.settings
+        if config.anthropic_backend == "gemini":
+            adapter = GeminiAnthropicAdapter()
+            return await proxy(
+                request,
+                prepare=adapter.prepare,
+                response_adapter=adapter,
+                forward_query=False,
+            )
+        return await proxy(
+            request,
+            prepare=_prepare_anthropic_request,
+            forward_query=False,
+        )
+
+    @application.post("/v1/messages/count_tokens")
+    async def anthropic_count_tokens(request: Request):
+        config: Settings = request.app.state.settings
+        if config.anthropic_backend == "gemini":
+            adapter = GeminiCountTokensAdapter()
+            return await proxy(
+                request,
+                prepare=adapter.prepare,
+                response_adapter=adapter,
+                forward_query=False,
+            )
+        return await proxy(
+            request,
+            prepare=lambda body, config: _prepare_anthropic_request(
+                body,
+                config,
+                count_tokens=True,
+            ),
+            forward_query=False,
         )
 
     @application.api_route(
@@ -500,7 +743,11 @@ def create_app(
     )
     async def openai_proxy(request: Request, path: str):
         config: Settings = request.app.state.settings
-        return await proxy(request, f"{config.openai_base_url}/{path}")
+        return await proxy(
+            request,
+            f"{config.openai_base_url}/{path}",
+            preprocess_openai_model=True,
+        )
 
     @application.api_route(
         "/vertex/{api_version}/{path:path}",

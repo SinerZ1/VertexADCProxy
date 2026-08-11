@@ -24,8 +24,9 @@ The application fails to start if either of these is missing or invalid:
 - **Path Rewriting:**
   - `/v1/{path}` -> `/v1/projects/{project}/locations/{location}/endpoints/openapi/{path}` (OpenAI endpoint)
   - `/vertex/{api_version}/{path}` -> `/{api_version}/projects/{project}/locations/{location}/{path}` (Native REST endpoint, supports `v1` and `v1beta1`)
-- **Model Name Normalization:**
+- **Model Name Normalization & Thought Signature Injection:**
   - For incoming `/v1/*` requests, if the JSON body has `"model": "google/<model_name>"`, the proxy automatically strips the `google/` prefix before forwarding to Vertex.
+  - Automatically injects `skip_thought_signature_validator` into assistant function calls lacking a `thought_signature` in conversation history to prevent Vertex AI 400 INVALID_ARGUMENT errors on Gemini 2.5 and 3 models.
 - **Token Management & Upstream 401s:**
   - Tokens are retrieved using Application Default Credentials (ADC) and cached.
   - If the upstream Vertex AI endpoint returns a `401 Unauthorized`, the proxy automatically forces an immediate token refresh and retries the request exactly once.

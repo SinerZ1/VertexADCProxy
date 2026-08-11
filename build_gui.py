@@ -14,7 +14,6 @@ def main():
         sys.exit(1)
 
     # 2. Ensure icon.ico exists from Vertex Proxy.png
-    import os
     from pathlib import Path
     png_path = Path("Vertex Proxy.png")
     ico_path = Path("icon.ico")
