@@ -21,6 +21,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from starlette.background import BackgroundTask
 
 from vertex_proxy.anthropic_gemini import GeminiAnthropicAdapter, GeminiCountTokensAdapter
+from vertex_proxy.openai_responses import OpenAIResponsesAdapter
 
 LOGGER = logging.getLogger("vertex_proxy")
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -697,6 +698,16 @@ def create_app(
             status_code=response.status_code,
             headers=response_headers,
             background=BackgroundTask(response.aclose),
+        )
+
+    @application.post("/v1/responses")
+    async def openai_responses(request: Request):
+        adapter = OpenAIResponsesAdapter()
+        return await proxy(
+            request,
+            prepare=adapter.prepare,
+            response_adapter=adapter,
+            forward_query=False,
         )
 
     @application.post("/v1/messages")

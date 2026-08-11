@@ -4,7 +4,7 @@
 
 支持功能：
 
-- OpenAI 兼容入口 /v1/*，包括 /v1/chat/completions 的普通及 SSE 流式响应
+- OpenAI 兼容入口 `/v1/*`，包括 `/v1/chat/completions` 和 OpenAI 新 Responses API `/v1/responses` 的普通及 SSE 流式响应
 - Anthropic Messages 入口 `/v1/messages` 和 `/v1/messages/count_tokens`，可将 Claude Code 请求转换后交给 Vertex Gemini，也可选用 Vertex Claude 直通
 - Vertex 原生 REST 入口 /vertex/v1/* 和 /vertex/v1beta1/*
 - 自动读取 GOOGLE_CLOUD_PROJECT 与 VERTEX_LOCATION
@@ -112,6 +112,39 @@ for chunk in stream:
 ```
 
 GET /v1/models 接口不会向上游 Google 发送查询，而是直接返回 VERTEX_MODELS 环境变量中配置的本地模型列表，从而避免产生额外的 Vertex API 调用请求。
+
+### OpenAI Responses API (/v1/responses)
+
+代理支持 OpenAI 新的 Responses API 端点 `/v1/responses`（如 `client.responses.create(...)`）：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="change-me",
+)
+
+# 非流式调用
+response = client.responses.create(
+    model="google/gemini-2.5-flash",
+    instructions="You are a helpful assistant",
+    input="Hello!",
+)
+print(response.output)
+
+# 流式调用 (SSE)
+stream = client.responses.create(
+    model="google/gemini-2.5-flash",
+    instructions="You are a helpful assistant",
+    input="Hello!",
+    stream=True,
+)
+for chunk in stream:
+    print(chunk)
+```
+
+`/v1/responses` 会自动将 `instructions`、`input`（字符串或多轮消息/tool_result/function_call 数组）、`tools`（OpenAI function 格式或简化 name/parameters 格式）、`response_format` 等参数转换为 Vertex OpenAI `chat/completions` 请求，并将上游响应与 SSE 流式事件双向转换为标准的 `response` 对象及 `response.created` / `response.text.delta` / `response.function_call_arguments.delta` / `response.completed` 事件。
 
 ## Claude Code / Anthropic Messages 调用
 
