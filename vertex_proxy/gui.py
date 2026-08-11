@@ -537,8 +537,6 @@ class UvicornServerThread(QThread):
         project: str,
         location: str,
         models: str,
-        anthropic_backend: str,
-        anthropic_gemini_model: str,
         connect_timeout: float,
         read_timeout: float,
         use_proxy: bool,
@@ -552,8 +550,6 @@ class UvicornServerThread(QThread):
         self.project = project
         self.location = location
         self.models = models
-        self.anthropic_backend = anthropic_backend
-        self.anthropic_gemini_model = anthropic_gemini_model
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.use_proxy = use_proxy
@@ -573,10 +569,8 @@ class UvicornServerThread(QThread):
             env_vars["VERTEX_PROXY_API_KEY"] = self.api_key
         else:
             env_vars["VERTEX_PROXY_API_KEY"] = ""
-            
+
         env_vars["VERTEX_MODELS"] = self.models
-        env_vars["VERTEX_ANTHROPIC_BACKEND"] = self.anthropic_backend
-        env_vars["VERTEX_ANTHROPIC_GEMINI_MODEL"] = self.anthropic_gemini_model
         env_vars["VERTEX_CONNECT_TIMEOUT"] = str(self.connect_timeout)
         env_vars["VERTEX_READ_TIMEOUT"] = str(self.read_timeout)
         
@@ -802,36 +796,14 @@ class VertexProxyApp(QMainWindow):
         test_hbox.addWidget(self.btn_test_conn)
         grid_gcp.addLayout(test_hbox, 4, 1)
 
-        grid_gcp.addWidget(QLabel("Claude Code 后端:"), 5, 0)
-        self.cmb_anthropic_backend = QComboBox()
-        self.cmb_anthropic_backend.addItem("Gemini 协议转换（推荐）", "gemini")
-        self.cmb_anthropic_backend.addItem("Vertex Claude 直通", "claude")
-        self.cmb_anthropic_backend.setToolTip(
-            "Gemini：把 Claude Code 的 Anthropic Messages 请求转换为 Vertex Gemini 请求；"
-            "Claude：直接调用已启用的 Vertex Claude 模型"
-        )
-        self.cmb_anthropic_backend.currentIndexChanged.connect(
-            self.update_anthropic_controls
-        )
-        grid_gcp.addWidget(self.cmb_anthropic_backend, 5, 1)
-
-        grid_gcp.addWidget(QLabel("Claude Code Gemini 模型:"), 6, 0)
-        self.cmb_anthropic_gemini_model = QComboBox()
-        self.cmb_anthropic_gemini_model.setEditable(True)
-        self.cmb_anthropic_gemini_model.setToolTip(
-            "代理实际调用的 Vertex Gemini 模型，对应 "
-            "VERTEX_ANTHROPIC_GEMINI_MODEL；与 Claude Code 客户端的 "
-            "ANTHROPIC_MODEL 别名相互独立"
-        )
-        grid_gcp.addWidget(self.cmb_anthropic_gemini_model, 6, 1)
-
         anthropic_hint = QLabel(
-            "ANTHROPIC_MODEL 是 Claude Code 发送的客户端模型名；Gemini 模式下，"
-            "实际 Vertex 模型由上面的选项决定。"
+            "Anthropic 端点 (Messages 协议) 统一转换为 Vertex Gemini。支持客户端直接传入 "
+            "Gemini 模型 ID (如 gemini-2.5-flash) 或适配 Claude Desktop 的 claude- 前缀 ID (如 claude-2.5-flash)；"
+            "系统会自动校验请求的模型是否已在上方勾选并启用。"
         )
         anthropic_hint.setWordWrap(True)
         anthropic_hint.setObjectName("subtitle_label")
-        grid_gcp.addWidget(anthropic_hint, 7, 0, 1, 2)
+        grid_gcp.addWidget(anthropic_hint, 5, 0, 1, 2)
 
         left_layout.addWidget(grp_gcp)
 
@@ -1061,18 +1033,6 @@ class VertexProxyApp(QMainWindow):
         for m in all_models:
             self.cmb_test_model.addItem(m, checked=(m in selected_models))
 
-        backend = config.get("anthropic_backend", "gemini")
-        backend_index = self.cmb_anthropic_backend.findData(backend)
-        self.cmb_anthropic_backend.setCurrentIndex(
-            backend_index if backend_index >= 0 else 0
-        )
-        default_anthropic_model = selected_models[0] if selected_models else ""
-        self.refresh_anthropic_model_choices(
-            all_models,
-            config.get("anthropic_gemini_model", default_anthropic_model),
-        )
-        self.update_anthropic_controls()
-
         log_mode = config.get("log_mode", "full")
         self.set_log_mode(log_mode)
 
@@ -1082,7 +1042,7 @@ class VertexProxyApp(QMainWindow):
             item = self.cmb_test_model.model().item(i)
             if item:
                 all_models.append(item.text())
-        
+
         config = {
             "port": int(self.txt_port.text().strip() or "10101"),
             "api_key": self.txt_api_key.text().strip(),
@@ -1095,33 +1055,8 @@ class VertexProxyApp(QMainWindow):
             "log_mode": getattr(self, "_log_mode", "full"),
             "all_models": all_models,
             "selected_models": self.cmb_test_model.checked_items(),
-            "anthropic_backend": self.cmb_anthropic_backend.currentData() or "gemini",
-            "anthropic_gemini_model": self.cmb_anthropic_gemini_model.currentText().strip(),
         }
         save_config(config)
-
-    def refresh_anthropic_model_choices(
-        self,
-        models: list[str],
-        selected: str = "",
-    ) -> None:
-        current = selected.strip() or self.cmb_anthropic_gemini_model.currentText().strip()
-        self.cmb_anthropic_gemini_model.blockSignals(True)
-        self.cmb_anthropic_gemini_model.clear()
-        self.cmb_anthropic_gemini_model.addItems(models)
-        if current:
-            index = self.cmb_anthropic_gemini_model.findText(current)
-            if index >= 0:
-                self.cmb_anthropic_gemini_model.setCurrentIndex(index)
-            else:
-                self.cmb_anthropic_gemini_model.setEditText(current)
-        self.cmb_anthropic_gemini_model.blockSignals(False)
-
-    def update_anthropic_controls(self, _index: int | None = None) -> None:
-        is_gemini = self.cmb_anthropic_backend.currentData() == "gemini"
-        self.cmb_anthropic_gemini_model.setEnabled(
-            self.cmb_anthropic_backend.isEnabled() and is_gemini
-        )
 
     def set_log_mode(self, mode: str):
         self._log_mode = mode
@@ -1177,10 +1112,7 @@ class VertexProxyApp(QMainWindow):
 
             # Keep currently checked models
             currently_checked = self.cmb_test_model.checked_items()
-            current_anthropic_model = (
-                self.cmb_anthropic_gemini_model.currentText().strip()
-            )
-            
+
             # Clear and rebuild
             self.cmb_test_model.model().clear()
             for m in models_list:
@@ -1188,13 +1120,7 @@ class VertexProxyApp(QMainWindow):
                 # otherwise, preserve the previously checked status.
                 is_checked = (m in currently_checked) or (not currently_checked)
                 self.cmb_test_model.addItem(m, checked=is_checked)
-            self.refresh_anthropic_model_choices(
-                models_list,
-                current_anthropic_model
-                if current_anthropic_model in models_list
-                else models_list[0],
-            )
-                
+
             QMessageBox.information(self, "获取模型成功", f"连接成功，共发现 {len(models_list)} 个模型")
             self.append_log(f"系统消息 - 获取模型：成功。共发现 {len(models_list)} 个 Gemini 模型。\n")
             self.save_current_settings()
@@ -1237,18 +1163,6 @@ class VertexProxyApp(QMainWindow):
         else:
             models = "gemini-3.5-flash,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-3.1-pro-preview"
 
-        anthropic_backend = self.cmb_anthropic_backend.currentData() or "gemini"
-        anthropic_gemini_model = (
-            self.cmb_anthropic_gemini_model.currentText().strip()
-        )
-        if anthropic_backend == "gemini" and not anthropic_gemini_model:
-            QMessageBox.critical(
-                self,
-                "启动失败",
-                "请选择 Claude Code 实际使用的 Gemini 模型。",
-            )
-            return
-        
         # Default timeouts
         connect_timeout = 10.0
         read_timeout = 300.0
@@ -1265,8 +1179,6 @@ class VertexProxyApp(QMainWindow):
             project=project,
             location=location,
             models=models,
-            anthropic_backend=anthropic_backend,
-            anthropic_gemini_model=anthropic_gemini_model,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             use_proxy=self.chk_use_proxy.isChecked(),
@@ -1327,11 +1239,6 @@ class VertexProxyApp(QMainWindow):
         self.txt_project.setEnabled(enabled)
         self.cmb_location.setEnabled(enabled)
         self.txt_creds_path.setEnabled(enabled)
-        self.cmb_anthropic_backend.setEnabled(enabled)
-        if enabled:
-            self.update_anthropic_controls()
-        else:
-            self.cmb_anthropic_gemini_model.setEnabled(False)
         self.chk_use_proxy.setEnabled(enabled)
         if enabled:
             self.toggle_proxy_fields(self.chk_use_proxy.isChecked())

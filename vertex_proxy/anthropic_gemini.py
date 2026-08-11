@@ -320,9 +320,7 @@ def _convert_tool_choice(value: Any) -> tuple[Any | None, bool | None]:
 def anthropic_to_openai(payload: Mapping[str, Any], gemini_model: str) -> dict[str, Any]:
     model = gemini_model.strip()
     if not model:
-        raise ValueError(
-            "Gemini 后端尚未配置；请设置 VERTEX_ANTHROPIC_GEMINI_MODEL"
-        )
+        raise ValueError("未指定有效的 Gemini 模型")
     if "/" not in model:
         model = f"google/{model}"
 
@@ -354,26 +352,32 @@ def anthropic_to_openai(payload: Mapping[str, Any], gemini_model: str) -> dict[s
     return result
 
 
-def _configured_gemini_model(config: Any) -> str:
-    configured = str(getattr(config, "anthropic_gemini_model", "")).strip()
-    if not configured:
-        for model in getattr(config, "models", ()):
-            candidate = str(model).strip()
-            if candidate.removeprefix("google/").startswith("gemini-"):
-                configured = candidate
-                break
-    if not configured:
-        raise ValueError(
-            "Gemini 后端尚未配置；请设置 VERTEX_ANTHROPIC_GEMINI_MODEL，"
-            "或在 VERTEX_MODELS 中至少配置一个 Gemini 模型"
-        )
-    return configured
+def resolve_gemini_model(client_model: str, config: Any) -> str:
+    """Resolve incoming client_model to a validated Gemini model ID."""
+    if not isinstance(client_model, str) or not client_model.strip():
+        raise ValueError("缺少有效的 model 字段")
+
+    raw_model = client_model.strip()
+    if raw_model.startswith("claude-"):
+        target_model = "gemini-" + raw_model[len("claude-"):]
+    elif raw_model.startswith("google/"):
+        target_model = raw_model.removeprefix("google/")
+    else:
+        target_model = raw_model
+
+    enabled_models = getattr(config, "models", ())
+    if enabled_models:
+        normalized_enabled = {m.removeprefix("google/") for m in enabled_models}
+        if target_model not in normalized_enabled:
+            raise ValueError(f"模型 '{raw_model}' (解析为 '{target_model}') 未在已启用的模型列表中")
+
+    return target_model
 
 
 def _native_model_id(gemini_model: str) -> str:
     model = gemini_model.removeprefix("google/")
     if not _SAFE_GEMINI_MODEL.fullmatch(model):
-        raise ValueError("VERTEX_ANTHROPIC_GEMINI_MODEL 不是有效的 Gemini 模型 ID")
+        raise ValueError(f"'{model}' 不是有效的 Gemini 模型 ID")
     return model
 
 
@@ -818,7 +822,8 @@ class GeminiAnthropicAdapter:
 
         self.client_model = client_model.strip()
         self.stream = payload.get("stream") is True
-        converted = anthropic_to_openai(payload, _configured_gemini_model(config))
+        target_gemini = resolve_gemini_model(self.client_model, config)
+        converted = anthropic_to_openai(payload, target_gemini)
         return f"{config.openai_base_url}/chat/completions", _json_bytes(converted)
 
     def response_headers(
@@ -874,7 +879,8 @@ class GeminiCountTokensAdapter:
         if not isinstance(client_model, str) or not client_model.strip():
             raise ValueError("缺少有效的 model 字段")
 
-        model = _native_model_id(_configured_gemini_model(config))
+        target_gemini = resolve_gemini_model(client_model.strip(), config)
+        model = _native_model_id(target_gemini)
         url = (
             f"{config.native_base_url('v1')}/publishers/google/models/"
             f"{model}:countTokens"

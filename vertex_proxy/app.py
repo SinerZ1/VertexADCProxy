@@ -26,18 +26,6 @@ from vertex_proxy.openai_responses import OpenAIResponsesAdapter
 LOGGER = logging.getLogger("vertex_proxy")
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 _SAFE_RESOURCE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
-_SAFE_ANTHROPIC_MODEL = re.compile(r"^[a-z0-9][a-z0-9._@-]{0,127}$")
-_DATED_ANTHROPIC_MODEL = re.compile(r"^(?P<name>claude-[a-z0-9.-]+)-(?P<date>[0-9]{8})$")
-_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
-_DEFAULT_ANTHROPIC_MODEL_MAP = {
-    # Anthropic API IDs whose current Google Cloud model IDs also reorder a
-    # family/version segment. Other dated Anthropic IDs simply drop the date.
-    "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-v2",
-    "claude-4-sonnet-20250514": "claude-sonnet-4",
-    "claude-4-5-sonnet-20250929": "claude-sonnet-4-5",
-    "claude-4-5-haiku-20251001": "claude-haiku-4-5",
-    "claude-4-5-opus-20251101": "claude-opus-4-5",
-}
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -69,34 +57,12 @@ def _positive_float(value: str, name: str, *, allow_zero: bool = False) -> float
     return parsed
 
 
-def _anthropic_model_map(value: str) -> tuple[tuple[str, str], ...]:
-    pairs: list[tuple[str, str]] = []
-    for raw_pair in value.split(","):
-        raw_pair = raw_pair.strip()
-        if not raw_pair:
-            continue
-        source, separator, target = raw_pair.partition("=")
-        source = source.strip()
-        target = target.strip()
-        if not separator or not source or not target:
-            raise RuntimeError(
-                "VERTEX_ANTHROPIC_MODEL_MAP 必须使用 client-model=vertex-model 格式"
-            )
-        if not _SAFE_ANTHROPIC_MODEL.fullmatch(target):
-            raise RuntimeError("VERTEX_ANTHROPIC_MODEL_MAP 包含不合法的 Vertex 模型名")
-        pairs.append((source, target))
-    return tuple(pairs)
-
-
 @dataclass(frozen=True)
 class Settings:
     project: str
     location: str
     proxy_api_key: str | None = None
     models: tuple[str, ...] = ()
-    anthropic_model_map: tuple[tuple[str, str], ...] = ()
-    anthropic_backend: str = "claude"
-    anthropic_gemini_model: str = ""
     connect_timeout: float = 10.0
     read_timeout: float | None = 300.0
     token_refresh_skew: float = 300.0
@@ -122,21 +88,11 @@ class Settings:
         )
         raw_models = source.get("VERTEX_MODELS", "")
         models = tuple(dict.fromkeys(item.strip() for item in raw_models.split(",") if item.strip()))
-        anthropic_backend = source.get("VERTEX_ANTHROPIC_BACKEND", "claude").strip().lower()
-        if anthropic_backend not in {"claude", "gemini"}:
-            raise RuntimeError("VERTEX_ANTHROPIC_BACKEND 只能是 claude 或 gemini")
         return cls(
             project=project,
             location=location,
             proxy_api_key=source.get("VERTEX_PROXY_API_KEY") or None,
             models=models,
-            anthropic_model_map=_anthropic_model_map(
-                source.get("VERTEX_ANTHROPIC_MODEL_MAP", "")
-            ),
-            anthropic_backend=anthropic_backend,
-            anthropic_gemini_model=source.get(
-                "VERTEX_ANTHROPIC_GEMINI_MODEL", ""
-            ).strip(),
             connect_timeout=_positive_float(
                 source.get("VERTEX_CONNECT_TIMEOUT", "10"),
                 "VERTEX_CONNECT_TIMEOUT",
@@ -168,36 +124,6 @@ class Settings:
         return (
             f"https://{self.upstream_host}/{api_version}/projects/{self.project}"
             f"/locations/{self.location}"
-        )
-
-    def resolve_anthropic_model(self, client_model: str) -> str:
-        configured = dict(_DEFAULT_ANTHROPIC_MODEL_MAP)
-        configured.update(self.anthropic_model_map)
-        if client_model in configured:
-            return configured[client_model]
-
-        dated_match = _DATED_ANTHROPIC_MODEL.fullmatch(client_model)
-        if dated_match:
-            vertex_model = dated_match.group("name")
-        else:
-            vertex_model = client_model
-
-        if not _SAFE_ANTHROPIC_MODEL.fullmatch(vertex_model):
-            raise ValueError("model 必须是合法的 Claude/Vertex 模型 ID")
-        return vertex_model
-
-    def anthropic_model_url(self, model: str, method: str) -> str:
-        return (
-            f"https://{self.upstream_host}/v1/projects/{self.project}"
-            f"/locations/{self.location}/publishers/anthropic/models/{model}:{method}"
-        )
-
-    @property
-    def anthropic_count_tokens_url(self) -> str:
-        return (
-            f"https://{self.upstream_host}/v1/projects/{self.project}"
-            f"/locations/{self.location}/publishers/anthropic/models/"
-            "count-tokens:rawPredict"
         )
 
 
@@ -391,7 +317,7 @@ def _prepare_anthropic_request(
         upstream_url = config.anthropic_count_tokens_url
     else:
         payload.pop("model", None)
-        payload["anthropic_version"] = _VERTEX_ANTHROPIC_VERSION
+        payload["anthropic_version"] = "vertex-2023-10-16"
         method = "streamRawPredict" if payload.get("stream") is True else "rawPredict"
         upstream_url = config.anthropic_model_url(vertex_model, method)
 
@@ -469,12 +395,30 @@ def create_app(
         if not _authorized(request, config.proxy_api_key):
             return _error(401, "Invalid proxy API key", "authentication_error")
         now = int(datetime.now(timezone.utc).timestamp())
+        data = []
+        for model in config.models:
+            norm_model = model.removeprefix("google/")
+            data.append({
+                "id": norm_model,
+                "display_name": norm_model,
+                "name": norm_model,
+                "object": "model",
+                "created": now,
+                "owned_by": "google",
+            })
+            if norm_model.startswith("gemini-"):
+                claude_alias = "claude-" + norm_model[len("gemini-"):]
+                data.append({
+                    "id": claude_alias,
+                    "display_name": norm_model,
+                    "name": norm_model,
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "google",
+                })
         return {
             "object": "list",
-            "data": [
-                {"id": model, "object": "model", "created": now, "owned_by": "google"}
-                for model in config.models
-            ],
+            "data": data,
         }
 
     @application.get("/v1/models/{model_id:path}")
@@ -484,22 +428,26 @@ def create_app(
             return _error(401, "Invalid proxy API key", "authentication_error")
 
         requested_norm = model_id.removeprefix("google/")
+        if requested_norm.startswith("claude-"):
+            resolved_gemini = "gemini-" + requested_norm[len("claude-"):]
+        else:
+            resolved_gemini = requested_norm
+
         if config.models:
-            matched = None
+            matched = False
             for m in config.models:
                 m_norm = m.removeprefix("google/")
-                if m == model_id or m_norm == requested_norm:
-                    matched = m
+                if m_norm == resolved_gemini or m == model_id:
+                    matched = True
                     break
             if not matched:
-                return _error(404, f"Model '{model_id}' not found", "invalid_request_error")
-            target_id = matched
-        else:
-            target_id = model_id
+                return _error(404, f"Model '{model_id}' not found or not enabled", "invalid_request_error")
 
         now = int(datetime.now(timezone.utc).timestamp())
         return {
-            "id": target_id,
+            "id": model_id,
+            "display_name": resolved_gemini,
+            "name": resolved_gemini,
             "object": "model",
             "created": now,
             "owned_by": "google",
@@ -712,39 +660,21 @@ def create_app(
 
     @application.post("/v1/messages")
     async def anthropic_messages(request: Request):
-        config: Settings = request.app.state.settings
-        if config.anthropic_backend == "gemini":
-            adapter = GeminiAnthropicAdapter()
-            return await proxy(
-                request,
-                prepare=adapter.prepare,
-                response_adapter=adapter,
-                forward_query=False,
-            )
+        adapter = GeminiAnthropicAdapter()
         return await proxy(
             request,
-            prepare=_prepare_anthropic_request,
+            prepare=adapter.prepare,
+            response_adapter=adapter,
             forward_query=False,
         )
 
     @application.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(request: Request):
-        config: Settings = request.app.state.settings
-        if config.anthropic_backend == "gemini":
-            adapter = GeminiCountTokensAdapter()
-            return await proxy(
-                request,
-                prepare=adapter.prepare,
-                response_adapter=adapter,
-                forward_query=False,
-            )
+        adapter = GeminiCountTokensAdapter()
         return await proxy(
             request,
-            prepare=lambda body, config: _prepare_anthropic_request(
-                body,
-                config,
-                count_tokens=True,
-            ),
+            prepare=adapter.prepare,
+            response_adapter=adapter,
             forward_query=False,
         )
 
