@@ -177,7 +177,18 @@ class AdcTokenProvider:
     async def token(self, *, force_refresh: bool = False) -> str:
         async with self._lock:
             if force_refresh or self._needs_refresh():
-                await asyncio.to_thread(self._credentials.refresh, self._auth_request)
+                try:
+                    await asyncio.to_thread(self._credentials.refresh, self._auth_request)
+                except Exception as exc:
+                    LOGGER.warning("Failed to refresh ADC token: %s", exc)
+                    expiry = self._credentials.expiry
+                    if expiry is not None:
+                        if expiry.tzinfo is None:
+                            expiry = expiry.replace(tzinfo=timezone.utc)
+                        if expiry > datetime.now(timezone.utc) and self._credentials.token:
+                            LOGGER.info("Reusing existing valid ADC token (expires at %s)", expiry)
+                            return self._credentials.token
+                    raise RuntimeError(f"ADC 凭据刷新失败: {exc}") from exc
             token = self._credentials.token
             if not token:
                 raise RuntimeError("ADC 未返回 access token")
@@ -214,12 +225,12 @@ def _format_json(text: str) -> str:
         return text
 
 
-def _decompress_response(body: bytes, headers: Mapping[str, str]) -> bytes:
-    content_encoding = headers.get("content-encoding", "").lower()
-    if not content_encoding or not body:
+def _decompress_response(body: bytes, headers: Mapping[str, str] | None = None) -> bytes:
+    if not body:
         return body
+    content_encoding = headers.get("content-encoding", "").lower() if headers else ""
     try:
-        if "gzip" in content_encoding:
+        if "gzip" in content_encoding or body.startswith(b"\x1f\x8b"):
             import gzip
             return gzip.decompress(body)
         elif "deflate" in content_encoding:
@@ -237,6 +248,89 @@ def _decompress_response(body: bytes, headers: Mapping[str, str]) -> bytes:
     except Exception as exc:
         LOGGER.warning("Decompression failed: %s", exc)
     return body
+
+
+def _sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    sanitized = {}
+    for name, value in headers.items():
+        name_lower = name.lower()
+        if (
+            name_lower in {"authorization", "x-api-key", "x-goog-api-key"}
+            or "signature" in name_lower
+            or "auth" in name_lower
+        ):
+            continue
+        sanitized[name] = value
+    return sanitized
+
+
+def _safe_decode_body(body: bytes) -> str:
+    if not body:
+        return ""
+    decompressed = _decompress_response(body)
+    try:
+        return decompressed.decode("utf-8", errors="replace")
+    except Exception:
+        return "<binary or undecodable body>"
+
+
+def _log_request(req_id: str, request: Request, req_body_str: str, log_mode: str) -> None:
+    if log_mode == "full":
+        LOGGER.info(
+            "[%s] Received request: %s %s | Headers: %s | Body: %s",
+            req_id,
+            request.method,
+            request.url,
+            _sanitize_headers(request.headers),
+            _format_json(req_body_str),
+        )
+    elif log_mode == "messages":
+        messages = None
+        if req_body_str:
+            try:
+                data = json.loads(req_body_str)
+                if isinstance(data, dict) and "messages" in data:
+                    messages = data["messages"]
+            except Exception:
+                pass
+        if messages is not None:
+            try:
+                msg_str = json.dumps(messages, indent=2, ensure_ascii=False)
+            except Exception:
+                msg_str = str(messages)
+            LOGGER.info("[%s] Request messages: %s", req_id, msg_str)
+        else:
+            LOGGER.info("[%s] Request Body: %s", req_id, _format_json(req_body_str))
+
+
+def _log_response(
+    req_id: str,
+    status_code: int,
+    resp_body_str: str,
+    log_mode: str,
+    resp_headers: Mapping[str, str] | None = None,
+    req_info: tuple[Request, str] | None = None,
+) -> None:
+    is_error = status_code != 200 or "content_filter" in resp_body_str
+    if log_mode == "full" or (log_mode == "errors" and is_error):
+        if log_mode == "errors" and req_info is not None:
+            req, body_str = req_info
+            LOGGER.warning(
+                "[%s] Request failed on %s %s | Request Headers: %s | Request Body: %s",
+                req_id,
+                req.method,
+                req.url,
+                _sanitize_headers(req.headers),
+                _format_json(body_str),
+            )
+        headers_dict = dict(resp_headers) if resp_headers else {}
+        LOGGER.info(
+            "[%s] Completed response: Status %s | Headers: %s | Body: %s",
+            req_id,
+            status_code,
+            headers_dict,
+            _format_json(resp_body_str),
+        )
 
 
 def _error(status_code: int, message: str, error_type: str) -> JSONResponse:
@@ -362,6 +456,21 @@ def create_app(
         # requests and httpx both honor HTTP_PROXY/HTTPS_PROXY with trust_env enabled.
         auth_session = requests.Session()
         auth_session.trust_env = True
+        try:
+            from urllib3.util import Retry
+            from requests.adapters import HTTPAdapter
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[500, 502, 503, 504],
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            auth_session.mount("https://", adapter)
+            auth_session.mount("http://", adapter)
+        except Exception as exc:
+            LOGGER.warning("Could not configure HTTPAdapter retry on auth_session: %s", exc)
+
         auth_request = GoogleAuthRequest(session=auth_session)
         token_provider = AdcTokenProvider(adc, auth_request, config.token_refresh_skew)
         timeout = httpx.Timeout(
@@ -453,17 +562,23 @@ def create_app(
         if not _authorized(request, config.proxy_api_key):
             return _error(401, "Invalid proxy API key", "authentication_error")
 
-        requested_norm = model_id.removeprefix("google/")
-        if requested_norm.startswith("claude-"):
-            resolved_gemini = "gemini-" + requested_norm[len("claude-"):]
+        requested_raw = model_id.strip()
+        requested_lower = requested_raw.lower()
+        if requested_lower.startswith("google/"):
+            requested_raw = requested_raw[len("google/"):]
+            requested_lower = requested_raw.lower()
+
+        if requested_lower.startswith("claude-"):
+            resolved_gemini = "gemini-" + requested_raw[len("claude-"):]
         else:
-            resolved_gemini = requested_norm
+            resolved_gemini = requested_raw
 
         if config.models:
             matched = False
             for m in config.models:
                 m_norm = m.removeprefix("google/")
-                if m_norm == resolved_gemini or m == model_id:
+                if m_norm.lower() == resolved_gemini.lower() or m.lower() == model_id.lower():
+                    resolved_gemini = m_norm
                     matched = True
                     break
             if not matched:
@@ -493,6 +608,7 @@ def create_app(
         log_mode = os.environ.get("VERTEX_PROXY_LOG_MODE", "full")
 
         body = await request.body()
+        req_body_str = _safe_decode_body(body)
 
         if not _authorized(request, config.proxy_api_key):
             LOGGER.warning(
@@ -501,17 +617,26 @@ def create_app(
                 request.method,
                 request.url,
             )
-            if log_mode in {"full", "errors"}:
-                LOGGER.info(
-                    "[%s] Completed response: Status 401 | Body: Invalid proxy API key",
-                    req_id,
-                )
+            _log_response(
+                req_id,
+                401,
+                "Invalid proxy API key",
+                log_mode,
+                req_info=(request, req_body_str),
+            )
             return _error(401, "Invalid proxy API key", "authentication_error")
 
         if prepare is not None:
             try:
                 upstream_url, body = prepare(body, config)
             except ValueError as exc:
+                _log_response(
+                    req_id,
+                    400,
+                    str(exc),
+                    log_mode,
+                    req_info=(request, req_body_str),
+                )
                 return _error(400, str(exc), "invalid_request_error")
         elif (
             preprocess_openai_model
@@ -530,50 +655,18 @@ def create_app(
             except Exception as exc:
                 LOGGER.warning("Failed to preprocess request body: %s", exc)
 
-        req_headers = {}
-        for name, value in request.headers.items():
-            name_lower = name.lower()
-            if name_lower in {"authorization", "x-api-key", "x-goog-api-key"} or "signature" in name_lower or "auth" in name_lower:
-                continue
-            req_headers[name] = value
-
-        req_body_str = ""
-        if body:
-            try:
-                req_body_str = body.decode("utf-8", errors="replace")
-            except Exception:
-                req_body_str = "<binary or undecodable body>"
-
-        if log_mode == "full":
-            LOGGER.info(
-                "[%s] Received request: %s %s | Headers: %s | Body: %s",
-                req_id,
-                request.method,
-                request.url,
-                req_headers,
-                _format_json(req_body_str),
-            )
-        elif log_mode == "messages":
-            messages = None
-            if body:
-                try:
-                    data = json.loads(body)
-                    if isinstance(data, dict) and "messages" in data:
-                        messages = data["messages"]
-                except Exception:
-                    pass
-            if messages is not None:
-                try:
-                    msg_str = json.dumps(messages, indent=2, ensure_ascii=False)
-                except Exception:
-                    msg_str = str(messages)
-                LOGGER.info("[%s] Request messages: %s", req_id, msg_str)
-            else:
-                LOGGER.info("[%s] Request Body: %s", req_id, _format_json(req_body_str))
+        _log_request(req_id, request, req_body_str, log_mode)
 
         client: httpx.AsyncClient = request.app.state.upstream_client
         token_provider: AdcTokenProvider = request.app.state.token_provider
         if upstream_url is None:
+            _log_response(
+                req_id,
+                500,
+                "Proxy upstream URL was not prepared",
+                log_mode,
+                req_info=(request, req_body_str),
+            )
             return _error(500, "Proxy upstream URL was not prepared", "internal_error")
 
         upstream_headers = _request_headers(request)
@@ -604,23 +697,26 @@ def create_app(
                 response = await client.send(upstream_request, stream=True)
         except Exception as exc:
             LOGGER.warning("Vertex upstream request failed: %s", exc.__class__.__name__)
-            if log_mode in {"full", "errors"}:
-                LOGGER.info(
-                    "[%s] Completed response: Status 502 | Body: Vertex upstream unavailable",
-                    req_id,
-                )
+            _log_response(
+                req_id,
+                502,
+                f"Vertex upstream unavailable: {exc}",
+                log_mode,
+                req_info=(request, req_body_str),
+            )
             return _error(502, "Vertex upstream unavailable", "upstream_error")
 
         if response.status_code == 404 and "html" in response.headers.get("content-type", "").lower():
             await response.aclose()
             err_msg = f"The requested URL '{request.url.path}' was not found on this server."
             LOGGER.warning("[%s] Upstream 404 Not Found (HTML) for %s %s", req_id, request.method, request.url.path)
-            if log_mode in {"full", "errors"}:
-                LOGGER.info(
-                    "[%s] Completed response: Status 404 | Body: %s",
-                    req_id,
-                    _format_json(f'{{"error": {{"message": "{err_msg}", "type": "invalid_request_error"}}}}'),
-                )
+            _log_response(
+                req_id,
+                404,
+                err_msg,
+                log_mode,
+                req_info=(request, req_body_str),
+            )
             return _error(404, err_msg, "invalid_request_error")
 
         response_headers = _response_headers(response)
@@ -639,33 +735,30 @@ def create_app(
                     accumulated_chunks.append(chunk)
                     yield chunk
             finally:
-                if log_mode == "full" or log_mode == "errors":
-                    decompressed_body = _decompress_response(
-                        b"".join(accumulated_chunks), response_headers
-                    )
-                    content_type = response_headers.get("content-type", "").lower()
-                    charset = "utf-8"
-                    if "charset=" in content_type:
-                        try:
-                            charset = content_type.split("charset=")[-1].strip().split(";")[0]
-                        except Exception:
-                            charset = "utf-8"
-                    
+                decompressed_body = _decompress_response(
+                    b"".join(accumulated_chunks), response_headers
+                )
+                content_type = response_headers.get("content-type", "").lower()
+                charset = "utf-8"
+                if "charset=" in content_type:
                     try:
-                        resp_body_str = decompressed_body.decode(charset, errors="replace")
+                        charset = content_type.split("charset=")[-1].strip().split(";")[0]
                     except Exception:
-                        resp_body_str = "<binary or undecodable response>"
-                    
-                    is_error = response.status_code != 200 or "content_filter" in resp_body_str
-                    if log_mode == "full" or (log_mode == "errors" and is_error):
-                        resp_headers = dict(response_headers)
-                        LOGGER.info(
-                            "[%s] Completed response: Status %s | Headers: %s | Body: %s",
-                            req_id,
-                            response.status_code,
-                            resp_headers,
-                            _format_json(resp_body_str),
-                        )
+                        charset = "utf-8"
+
+                try:
+                    resp_body_str = decompressed_body.decode(charset, errors="replace")
+                except Exception:
+                    resp_body_str = "<binary or undecodable response>"
+
+                _log_response(
+                    req_id,
+                    response.status_code,
+                    resp_body_str,
+                    log_mode,
+                    response_headers,
+                    req_info=(request, req_body_str),
+                )
 
         return StreamingResponse(
             logged_stream_generator(),
@@ -676,28 +769,41 @@ def create_app(
 
     @application.post("/v1/responses")
     async def openai_responses(request: Request):
+        req_id = secrets.token_hex(4)
         config: Settings = request.app.state.settings
-        if not _authorized(request, config.proxy_api_key):
-            return _error(401, "Invalid proxy API key", "authentication_error")
+        log_mode = os.environ.get("VERTEX_PROXY_LOG_MODE", "full")
 
         body = await request.body()
+        req_body_str = _safe_decode_body(body)
+
+        if not _authorized(request, config.proxy_api_key):
+            _log_response(req_id, 401, "Invalid proxy API key", log_mode, req_info=(request, req_body_str))
+            return _error(401, "Invalid proxy API key", "authentication_error")
+
         try:
             payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是 JSON 对象")
             agent_req = responses_to_agent_request(payload)
         except Exception as exc:
+            _log_response(req_id, 400, str(exc), log_mode, req_info=(request, req_body_str))
             return _error(400, str(exc), "invalid_request_error")
+
+        _log_request(req_id, request, req_body_str, log_mode)
 
         if agent_req.previous_response_id:
             store = request.app.state.agent_state_store
             prev_state = await store.get_response_state(agent_req.previous_response_id)
             if not prev_state:
-                return _error(400, f"Previous response ID '{agent_req.previous_response_id}' is invalid or expired.", "invalid_request_error")
+                err = f"Previous response ID '{agent_req.previous_response_id}' is invalid or expired."
+                _log_response(req_id, 400, err, log_mode, req_info=(request, req_body_str))
+                return _error(400, err, "invalid_request_error")
             norm_req_model = agent_req.model.removeprefix("google/")
             norm_state_model = prev_state.model.removeprefix("google/")
             if norm_req_model != norm_state_model:
-                return _error(400, f"Incompatible model '{agent_req.model}' for previous response ID '{agent_req.previous_response_id}' (created with '{prev_state.model}')", "invalid_request_error")
+                err = f"Incompatible model '{agent_req.model}' for previous response ID '{agent_req.previous_response_id}' (created with '{prev_state.model}')"
+                _log_response(req_id, 400, err, log_mode, req_info=(request, req_body_str))
+                return _error(400, err, "invalid_request_error")
 
         runtime: AgentRuntime = request.app.state.agent_runtime
         client = request.app.state.upstream_client
@@ -706,41 +812,67 @@ def create_app(
         events_gen = runtime.run(agent_req, config, client, token_provider)
 
         if payload.get("stream") is True:
+            async def logged_stream():
+                accum = []
+                async for chunk in stream_responses_events(events_gen, agent_req.model.removeprefix("google/")):
+                    accum.append(chunk)
+                    yield chunk
+                resp_text = b"".join(accum).decode("utf-8", errors="replace")
+                _log_response(req_id, 200, resp_text, log_mode, {"content-type": "text/event-stream; charset=utf-8"}, req_info=(request, req_body_str))
+
             return StreamingResponse(
-                stream_responses_events(events_gen, agent_req.model.removeprefix("google/")),
+                logged_stream(),
                 media_type="text/event-stream; charset=utf-8"
             )
         else:
             try:
                 resp_json, resp_headers = await unary_responses_event(events_gen, agent_req.model.removeprefix("google/"))
+                _log_response(req_id, 200, json.dumps(resp_json, ensure_ascii=False), log_mode, resp_headers, req_info=(request, req_body_str))
                 return JSONResponse(status_code=200, content=resp_json, headers=resp_headers)
             except ValueError as exc:
+                _log_response(req_id, 400, str(exc), log_mode, req_info=(request, req_body_str))
                 return _error(400, str(exc), "invalid_request_error")
+            except Exception as exc:
+                _log_response(req_id, 500, str(exc), log_mode, req_info=(request, req_body_str))
+                return _error(500, str(exc), "internal_error")
 
     @application.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        req_id = secrets.token_hex(4)
         config: Settings = request.app.state.settings
-        if not _authorized(request, config.proxy_api_key):
-            return _error(401, "Invalid proxy API key", "authentication_error")
+        log_mode = os.environ.get("VERTEX_PROXY_LOG_MODE", "full")
 
         body = await request.body()
+        req_body_str = _safe_decode_body(body)
+
+        if not _authorized(request, config.proxy_api_key):
+            _log_response(req_id, 401, "Invalid proxy API key", log_mode, req_info=(request, req_body_str))
+            return _error(401, "Invalid proxy API key", "authentication_error")
+
         try:
             payload = json.loads(body)
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是 JSON 对象")
             agent_req = anthropic_to_agent_request(payload, config)
         except Exception as exc:
+            _log_response(req_id, 400, str(exc), log_mode, req_info=(request, req_body_str))
             return _error(400, str(exc), "invalid_request_error")
+
+        _log_request(req_id, request, req_body_str, log_mode)
 
         if agent_req.previous_response_id:
             store = request.app.state.agent_state_store
             prev_state = await store.get_response_state(agent_req.previous_response_id)
             if not prev_state:
-                return _error(400, f"Previous response ID '{agent_req.previous_response_id}' is invalid or expired.", "invalid_request_error")
+                err = f"Previous response ID '{agent_req.previous_response_id}' is invalid or expired."
+                _log_response(req_id, 400, err, log_mode, req_info=(request, req_body_str))
+                return _error(400, err, "invalid_request_error")
             norm_req_model = agent_req.model.removeprefix("google/")
             norm_state_model = prev_state.model.removeprefix("google/")
             if norm_req_model != norm_state_model:
-                return _error(400, f"Incompatible model '{agent_req.model}' for previous response ID '{agent_req.previous_response_id}' (created with '{prev_state.model}')", "invalid_request_error")
+                err = f"Incompatible model '{agent_req.model}' for previous response ID '{agent_req.previous_response_id}' (created with '{prev_state.model}')"
+                _log_response(req_id, 400, err, log_mode, req_info=(request, req_body_str))
+                return _error(400, err, "invalid_request_error")
 
         runtime: AgentRuntime = request.app.state.agent_runtime
         client = request.app.state.upstream_client
@@ -749,16 +881,29 @@ def create_app(
         events_gen = runtime.run(agent_req, config, client, token_provider)
 
         if payload.get("stream") is True:
+            async def logged_stream():
+                accum = []
+                async for chunk in stream_anthropic_events(events_gen, payload.get("model", "")):
+                    accum.append(chunk)
+                    yield chunk
+                resp_text = b"".join(accum).decode("utf-8", errors="replace")
+                _log_response(req_id, 200, resp_text, log_mode, {"content-type": "text/event-stream; charset=utf-8"}, req_info=(request, req_body_str))
+
             return StreamingResponse(
-                stream_anthropic_events(events_gen, payload.get("model", "")),
+                logged_stream(),
                 media_type="text/event-stream; charset=utf-8"
             )
         else:
             try:
                 resp_json, resp_headers = await unary_anthropic_event(events_gen, payload.get("model", ""))
+                _log_response(req_id, 200, json.dumps(resp_json, ensure_ascii=False), log_mode, resp_headers, req_info=(request, req_body_str))
                 return JSONResponse(status_code=200, content=resp_json, headers=resp_headers)
             except ValueError as exc:
+                _log_response(req_id, 400, str(exc), log_mode, req_info=(request, req_body_str))
                 return _error(400, str(exc), "invalid_request_error")
+            except Exception as exc:
+                _log_response(req_id, 500, str(exc), log_mode, req_info=(request, req_body_str))
+                return _error(500, str(exc), "internal_error")
 
     @application.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(request: Request):

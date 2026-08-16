@@ -169,8 +169,18 @@ class AgentRuntime:
             # Snapshot saved in ResponseState should be conversation messages only
             snapshot_messages = list(history_conv_msgs) + list(request.messages)
 
+            try:
+                token = await token_provider.token()
+            except Exception as exc:
+                yield AgentEvent(
+                    kind=AgentEventKind.ERROR,
+                    data={"message": f"Failed to acquire ADC token: {exc}", "status_code": 503}
+                )
+                yield AgentEvent(kind=AgentEventKind.COMPLETED, data={"id": response_id, "stop_reason": AgentStopReason.ERROR, "usage": {}})
+                return
+
             headers = {
-                "Authorization": f"Bearer {await token_provider.token()}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
             }
             url = f"{config.openai_base_url}/chat/completions"

@@ -57,6 +57,9 @@ def test_resolve_gemini_model_passthrough_and_prefix() -> None:
     # Claude Desktop prefix conversion (claude- -> gemini-)
     assert resolve_gemini_model("claude-2.5-flash", settings) == "gemini-2.5-flash"
     assert resolve_gemini_model("claude-2.5-pro", settings) == "gemini-2.5-pro"
+    # Case-insensitive prefix conversion (Claude- -> gemini-)
+    assert resolve_gemini_model("Claude-2.5-flash", settings) == "gemini-2.5-flash"
+    assert resolve_gemini_model("CLAUDE-2.5-PRO", settings) == "gemini-2.5-pro"
 
 
 def test_resolve_gemini_model_validation_error() -> None:
@@ -394,7 +397,7 @@ def test_anthropic_gemini_count_tokens_uses_native_api() -> None:
     assert response.status_code == 200
     assert response.json() == {"input_tokens": 42}
     assert str(seen[0].url) == (
-        "https://asia-east1-aiplatform.googleapis.com/v1/projects/sample-project/"
+        "https://asia-east1-aiplatform.googleapis.com/v1beta1/projects/sample-project/"
         "locations/asia-east1/publishers/google/models/gemini-2.5-pro:countTokens"
     )
 
@@ -472,3 +475,183 @@ def test_list_models_includes_gemini_and_claude_aliases() -> None:
 
         res3 = client.get("/v1/models/unknown-model")
         assert res3.status_code == 404
+
+
+def test_anthropic_gemini_count_tokens_merges_consecutive_turns_and_handles_thinking() -> None:
+    import json
+    credentials = FakeCredentials()
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=AsyncBytes(b'{"totalTokens":100}'),
+        )
+
+    app = create_app(
+        Settings(
+            project="sample-project",
+            location="asia-east1",
+            models=("google/gemini-2.5-pro",),
+        ),
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "Claude-2.5-pro",
+                "messages": [
+                    {"role": "user", "content": "Question 1"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "Thinking about it..."},
+                            {"type": "tool_use", "id": "tool_1", "name": "get_weather", "input": {"city": "Paris"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tool_1", "content": "22C sunny"},
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "tool_1", "content": "cached result"},
+                    {"role": "user", "content": "Follow-up question"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 100}
+
+    body = json.loads(seen[0].content.decode("utf-8"))
+    contents = body["contents"]
+    # Verify contents have strictly alternating roles (user -> model -> user)
+    roles = [c["role"] for c in contents]
+    assert roles == ["user", "model", "user"]
+    # The last user turn should have merged all 3 consecutive user/tool blocks
+    assert len(contents[2]["parts"]) == 3
+
+
+def test_anthropic_gemini_count_tokens_handles_gzipped_upstream_error() -> None:
+    import gzip
+    credentials = FakeCredentials()
+    err_json = b'{"error":{"code":400,"message":"Invalid argument provided","status":"INVALID_ARGUMENT"}}'
+    compressed_err = gzip.compress(err_json)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={
+                "content-type": "application/json; charset=UTF-8",
+                "content-encoding": "gzip",
+            },
+            stream=AsyncBytes(compressed_err),
+        )
+
+    app = create_app(
+        Settings(
+            project="sample-project",
+            location="asia-east1",
+            models=("google/gemini-2.5-pro",),
+        ),
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "claude-2.5-pro",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert response.status_code == 400
+    # Client receives decompressed UTF-8 json, not raw binary gzip
+    assert response.json()["error"]["message"] == "Invalid argument provided"
+
+
+def test_adc_token_provider_reuses_unexpired_token_on_refresh_failure() -> None:
+    from datetime import datetime, timedelta, timezone
+    from google.auth.credentials import Credentials
+    from vertex_proxy.app import AdcTokenProvider
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    class FlakyCredentials(Credentials):
+        def __init__(self):
+            super().__init__()
+            self.token = "existing-valid-token"
+            self.expiry = datetime.now(timezone.utc) + timedelta(seconds=60)
+            self.refresh_attempted = False
+
+        def refresh(self, request):
+            self.refresh_attempted = True
+            raise ConnectionResetError("Connection reset by peer during OAuth refresh")
+
+    creds = FlakyCredentials()
+    auth_req = GoogleAuthRequest()
+    # skew is 300s, so needs_refresh is True (since expiry is in 60s < 300s)
+    provider = AdcTokenProvider(creds, auth_req, refresh_skew=300.0)
+
+    # In async loop, token() should try to refresh, encounter error, but reuse existing unexpired token
+    import asyncio
+    token = asyncio.run(provider.token())
+    assert creds.refresh_attempted is True
+    assert token == "existing-valid-token"
+
+
+def test_anthropic_messages_supports_case_insensitive_claude_prefix() -> None:
+    credentials = FakeCredentials()
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1234567,
+                "model": "gemini-3.1-pro-preview",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hello there!"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+    app = create_app(
+        Settings(
+            project="sample-project",
+            location="global",
+            models=("gemini-3.1-pro-preview",),
+        ),
+        credentials=credentials,
+        upstream_transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "Claude-3.1-pro-preview",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    res_data = response.json()
+    assert res_data["role"] == "assistant"
+    assert res_data["content"][0]["text"] == "Hello there!"
+
+
+

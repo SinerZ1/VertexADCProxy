@@ -368,17 +368,25 @@ def resolve_gemini_model(client_model: str, config: Any) -> str:
         raise ValueError("缺少有效的 model 字段")
 
     raw_model = client_model.strip()
-    if raw_model.startswith("claude-"):
+    lower_model = raw_model.lower()
+    if lower_model.startswith("claude-"):
         target_model = "gemini-" + raw_model[len("claude-"):]
-    elif raw_model.startswith("google/"):
-        target_model = raw_model.removeprefix("google/")
+    elif lower_model.startswith("google/"):
+        target_model = raw_model[len("google/"):]
     else:
         target_model = raw_model
 
     enabled_models = getattr(config, "models", ())
     if enabled_models:
         normalized_enabled = {m.removeprefix("google/") for m in enabled_models}
-        if target_model not in normalized_enabled:
+        matched = False
+        target_lower = target_model.lower()
+        for m in normalized_enabled:
+            if m.lower() == target_lower:
+                target_model = m
+                matched = True
+                break
+        if not matched:
             raise ValueError(f"模型 '{raw_model}' (解析为 '{target_model}') 未在已启用的模型列表中")
 
     return target_model
@@ -439,7 +447,7 @@ def _native_assistant_parts(
     tool_names: dict[str, str],
 ) -> list[dict[str, Any]]:
     if isinstance(content, str):
-        return [{"text": content}]
+        return [{"text": content}] if content else [{"text": ""}]
     if not isinstance(content, list):
         return [{"text": str(content)}]
 
@@ -447,17 +455,23 @@ def _native_assistant_parts(
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
+        b_type = block.get("type")
+        if b_type == "text" and isinstance(block.get("text"), str):
             parts.append({"text": block["text"]})
-        elif block.get("type") == "tool_use" and isinstance(block.get("name"), str):
+        elif b_type == "thinking" and isinstance(block.get("thinking"), str):
+            parts.append({"text": block["thinking"]})
+        elif b_type == "tool_use" and isinstance(block.get("name"), str):
             tool_id = block.get("id")
             if isinstance(tool_id, str):
                 tool_names[tool_id] = block["name"]
+            input_data = block.get("input")
+            if not isinstance(input_data, dict):
+                input_data = {}
             parts.append(
                 {
                     "functionCall": {
                         "name": block["name"],
-                        "args": block.get("input", {}),
+                        "args": input_data,
                         "thought_signature": "skip_thought_signature_validator",
                         "thoughtSignature": "skip_thought_signature_validator",
                     },
@@ -469,7 +483,7 @@ def _native_assistant_parts(
 
 
 def anthropic_to_gemini_count_request(payload: Mapping[str, Any]) -> dict[str, Any]:
-    request: dict[str, Any] = {"contents": []}
+    raw_contents: list[dict[str, Any]] = []
     system = _system_text(payload.get("system"))
     system_parts = [system] if system else []
 
@@ -482,14 +496,14 @@ def anthropic_to_gemini_count_request(payload: Mapping[str, Any]) -> dict[str, A
             raise ValueError("messages 中的每一项都必须是对象")
         role = message.get("role")
         if role in {"assistant", "model"}:
-            request["contents"].append(
+            raw_contents.append(
                 {
                     "role": "model",
                     "parts": _native_assistant_parts(message.get("content", ""), tool_names),
                 }
             )
         elif role == "user":
-            request["contents"].append(
+            raw_contents.append(
                 {
                     "role": "user",
                     "parts": _native_user_parts(message.get("content", ""), tool_names),
@@ -502,7 +516,7 @@ def anthropic_to_gemini_count_request(payload: Mapping[str, Any]) -> dict[str, A
         elif role == "tool":
             tool_id = message.get("tool_call_id") or message.get("tool_use_id")
             name = tool_names.get(tool_id, "tool") if isinstance(tool_id, str) else "tool"
-            request["contents"].append(
+            raw_contents.append(
                 {
                     "role": "user",
                     "parts": [
@@ -522,6 +536,15 @@ def anthropic_to_gemini_count_request(payload: Mapping[str, Any]) -> dict[str, A
                 "messages 仅支持 user、assistant、system、developer、tool 和 model 角色"
             )
 
+    # Merge consecutive turns of the same role to strictly satisfy Gemini alternating role requirements
+    contents: list[dict[str, Any]] = []
+    for item in raw_contents:
+        if contents and contents[-1]["role"] == item["role"]:
+            contents[-1]["parts"].extend(item["parts"])
+        else:
+            contents.append({"role": item["role"], "parts": list(item["parts"])})
+
+    request: dict[str, Any] = {"contents": contents}
     if system_parts:
         request["systemInstruction"] = {
             "parts": [{"text": text} for text in system_parts]
@@ -894,7 +917,7 @@ class GeminiCountTokensAdapter:
         target_gemini = resolve_gemini_model(client_model.strip(), config)
         model = _native_model_id(target_gemini)
         url = (
-            f"{config.native_base_url('v1')}/publishers/google/models/"
+            f"{config.native_base_url('v1beta1')}/publishers/google/models/"
             f"{model}:countTokens"
         )
         return url, _json_bytes(anthropic_to_gemini_count_request(payload))
@@ -906,17 +929,12 @@ class GeminiCountTokensAdapter:
     ) -> dict[str, str]:
         drop_keys = {"content-length", "content-encoding", "transfer-encoding", "content-type"}
         result = {k: v for k, v in headers.items() if k.lower() not in drop_keys}
-        if response.status_code >= 400:
-            result["content-type"] = (
-                headers.get("content-type") or headers.get("Content-Type") or "application/json"
-            )
-            return result
         result["content-type"] = "application/json; charset=utf-8"
         return result
 
     async def transform(self, response: httpx.Response) -> AsyncIterator[bytes]:
         if response.status_code >= 400:
-            async for chunk in response.aiter_raw():
+            async for chunk in response.aiter_bytes():
                 yield chunk
             return
         body = await response.aread()

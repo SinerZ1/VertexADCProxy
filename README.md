@@ -12,10 +12,10 @@
 - Strict 混合工具调度与 `pause_turn`：支持 `VERTEX_AGENT_TOOL_MODE=strict` 状态挂起/恢复、输入冲突防护与自主迭代上限控制
 - Vertex 原生 REST 入口 /vertex/v1/* 和 /vertex/v1beta1/*
 - 自动读取 GOOGLE_CLOUD_PROJECT 与 VERTEX_LOCATION
-- ADC Token 提前刷新；上游返回 401 时强制刷新并重试一次
+- ADC Token 提前刷新；网络抖动自动重试与过期容错；上游返回 401 时强制刷新并重试一次
 - ADC 刷新和 Vertex HTTP 请求均支持读取 HTTP_PROXY、HTTPS_PROXY、NO_PROXY
 - 可选的本地 API Key 认证，防止代理接口在本地或网络中未授权访问
-- 完善的客户端请求和上游响应日志记录（支持全量、不输出、仅 messages 和仅错误 4 种模式，自动美化 JSON 输出）
+- 完善的客户端请求和上游响应日志记录（支持全量、不输出、仅 messages 和仅错误 4 种模式，自动解压 Gzip 并美化 JSON 输出）
 
 ## 安装与启动
 
@@ -239,7 +239,7 @@ https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LO
 | `VERTEX_ANTHROPIC_BACKEND` | `claude` | `/v1/messages` 的后端：`gemini` 启用协议转换，`claude` 使用 Vertex Claude 直通 |
 | `VERTEX_ANTHROPIC_GEMINI_MODEL` | 空 | Gemini 转换模式实际调用的模型；未设置时选取 `VERTEX_MODELS` 中第一个 Gemini 模型 |
 | `VERTEX_ANTHROPIC_MODEL_MAP` | 空 | Anthropic 客户端模型名到 Google Cloud Claude 模型 ID 的逗号分隔映射 |
-| `VERTEX_PROXY_LOG_MODE` | `full` | 日志记录输出模式（full: 全量输出, messages: 仅输出 request 消息体, errors: 仅输出非 200 或 content_filter 的 Response 错误, none: 不输出） |
+| `VERTEX_PROXY_LOG_MODE` | `full` | 日志记录输出模式（full: 全量输出, messages: 仅输出 request 消息体, errors: 仅输出非 200 或 content_filter 的错误响应并附带请求上下文, none: 不输出） |
 | `VERTEX_CONNECT_TIMEOUT` | `10` | 连接上游服务的超时时间，单位为秒 |
 | `VERTEX_READ_TIMEOUT` | `300` | 读取上游服务的超时时间，单位为秒；设为 `0` 表示无限制 |
 | `VERTEX_TOKEN_REFRESH_SKEW` | `300` | Token 到期前多少秒执行主动刷新操作 |
