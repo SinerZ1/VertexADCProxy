@@ -20,8 +20,19 @@ from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from starlette.background import BackgroundTask
 
-from vertex_proxy.anthropic_gemini import GeminiAnthropicAdapter, GeminiCountTokensAdapter
-from vertex_proxy.openai_responses import OpenAIResponsesAdapter
+from vertex_proxy.agent_runtime import AgentRuntime
+from vertex_proxy.agent_state import InMemoryAgentStateStore
+from vertex_proxy.anthropic_gemini import (
+    GeminiCountTokensAdapter,
+    anthropic_to_agent_request,
+    stream_anthropic_events,
+    unary_anthropic_event,
+)
+from vertex_proxy.openai_responses import (
+    responses_to_agent_request,
+    stream_responses_events,
+    unary_responses_event,
+)
 
 LOGGER = logging.getLogger("vertex_proxy")
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -66,6 +77,8 @@ class Settings:
     connect_timeout: float = 10.0
     read_timeout: float | None = 300.0
     token_refresh_skew: float = 300.0
+    agent_tool_mode: str = "best_effort"
+    agent_max_iterations: int = 5
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -88,6 +101,14 @@ class Settings:
         )
         raw_models = source.get("VERTEX_MODELS", "")
         models = tuple(dict.fromkeys(item.strip() for item in raw_models.split(",") if item.strip()))
+        agent_tool_mode = source.get("VERTEX_AGENT_TOOL_MODE", "best_effort").strip().lower()
+        try:
+            agent_max_iterations = int(source.get("VERTEX_AGENT_MAX_ITERATIONS", "5"))
+        except ValueError:
+            agent_max_iterations = 5
+        if agent_max_iterations < 1:
+            agent_max_iterations = 1
+
         return cls(
             project=project,
             location=location,
@@ -103,6 +124,8 @@ class Settings:
                 "VERTEX_TOKEN_REFRESH_SKEW",
                 allow_zero=True,
             ),
+            agent_tool_mode=agent_tool_mode if agent_tool_mode in {"best_effort", "strict"} else "best_effort",
+            agent_max_iterations=agent_max_iterations,
         )
 
     @property
@@ -353,9 +376,12 @@ def create_app(
             follow_redirects=False,
             transport=upstream_transport,
         )
+        state_store = InMemoryAgentStateStore()
         application.state.settings = config
         application.state.token_provider = token_provider
         application.state.upstream_client = client
+        application.state.agent_state_store = state_store
+        application.state.agent_runtime = AgentRuntime(state_store)
         LOGGER.info(
             "Vertex proxy ready: project=%s location=%s upstream=%s",
             config.project,
@@ -370,7 +396,7 @@ def create_app(
 
     application = FastAPI(
         title="Vertex AI ADC Proxy",
-        version="1.2.0",
+        version="1.1.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -650,23 +676,89 @@ def create_app(
 
     @application.post("/v1/responses")
     async def openai_responses(request: Request):
-        adapter = OpenAIResponsesAdapter()
-        return await proxy(
-            request,
-            prepare=adapter.prepare,
-            response_adapter=adapter,
-            forward_query=False,
-        )
+        config: Settings = request.app.state.settings
+        if not _authorized(request, config.proxy_api_key):
+            return _error(401, "Invalid proxy API key", "authentication_error")
+
+        body = await request.body()
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            agent_req = responses_to_agent_request(payload)
+        except Exception as exc:
+            return _error(400, str(exc), "invalid_request_error")
+
+        if agent_req.previous_response_id:
+            store = request.app.state.agent_state_store
+            prev_state = await store.get_response_state(agent_req.previous_response_id)
+            if not prev_state:
+                return _error(400, f"Previous response ID '{agent_req.previous_response_id}' is invalid or expired.", "invalid_request_error")
+            norm_req_model = agent_req.model.removeprefix("google/")
+            norm_state_model = prev_state.model.removeprefix("google/")
+            if norm_req_model != norm_state_model:
+                return _error(400, f"Incompatible model '{agent_req.model}' for previous response ID '{agent_req.previous_response_id}' (created with '{prev_state.model}')", "invalid_request_error")
+
+        runtime: AgentRuntime = request.app.state.agent_runtime
+        client = request.app.state.upstream_client
+        token_provider = request.app.state.token_provider
+
+        events_gen = runtime.run(agent_req, config, client, token_provider)
+
+        if payload.get("stream") is True:
+            return StreamingResponse(
+                stream_responses_events(events_gen, agent_req.model.removeprefix("google/")),
+                media_type="text/event-stream; charset=utf-8"
+            )
+        else:
+            try:
+                resp_json, resp_headers = await unary_responses_event(events_gen, agent_req.model.removeprefix("google/"))
+                return JSONResponse(status_code=200, content=resp_json, headers=resp_headers)
+            except ValueError as exc:
+                return _error(400, str(exc), "invalid_request_error")
 
     @application.post("/v1/messages")
     async def anthropic_messages(request: Request):
-        adapter = GeminiAnthropicAdapter()
-        return await proxy(
-            request,
-            prepare=adapter.prepare,
-            response_adapter=adapter,
-            forward_query=False,
-        )
+        config: Settings = request.app.state.settings
+        if not _authorized(request, config.proxy_api_key):
+            return _error(401, "Invalid proxy API key", "authentication_error")
+
+        body = await request.body()
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            agent_req = anthropic_to_agent_request(payload, config)
+        except Exception as exc:
+            return _error(400, str(exc), "invalid_request_error")
+
+        if agent_req.previous_response_id:
+            store = request.app.state.agent_state_store
+            prev_state = await store.get_response_state(agent_req.previous_response_id)
+            if not prev_state:
+                return _error(400, f"Previous response ID '{agent_req.previous_response_id}' is invalid or expired.", "invalid_request_error")
+            norm_req_model = agent_req.model.removeprefix("google/")
+            norm_state_model = prev_state.model.removeprefix("google/")
+            if norm_req_model != norm_state_model:
+                return _error(400, f"Incompatible model '{agent_req.model}' for previous response ID '{agent_req.previous_response_id}' (created with '{prev_state.model}')", "invalid_request_error")
+
+        runtime: AgentRuntime = request.app.state.agent_runtime
+        client = request.app.state.upstream_client
+        token_provider = request.app.state.token_provider
+
+        events_gen = runtime.run(agent_req, config, client, token_provider)
+
+        if payload.get("stream") is True:
+            return StreamingResponse(
+                stream_anthropic_events(events_gen, payload.get("model", "")),
+                media_type="text/event-stream; charset=utf-8"
+            )
+        else:
+            try:
+                resp_json, resp_headers = await unary_anthropic_event(events_gen, payload.get("model", ""))
+                return JSONResponse(status_code=200, content=resp_json, headers=resp_headers)
+            except ValueError as exc:
+                return _error(400, str(exc), "invalid_request_error")
 
     @application.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(request: Request):

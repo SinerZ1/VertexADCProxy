@@ -5,7 +5,11 @@
 支持功能：
 
 - OpenAI 兼容入口 `/v1/*`，包括 `/v1/chat/completions` 和 OpenAI 新 Responses API `/v1/responses` 的普通及 SSE 流式响应
-- Anthropic Messages 入口 `/v1/messages` 和 `/v1/messages/count_tokens`，可将 Claude Code 请求转换后交给 Vertex Gemini，也可选用 Vertex Claude 直通
+- Anthropic Messages 入口 `/v1/messages` 和 `/v1/messages/count_tokens`，统一接入 Agent Runtime 协议转换层
+- 统一 Agent Runtime 调度：自动规划 Vertex OpenAI 与 Vertex Native (REST) 双后端执行
+- 状态化会话与快照恢复：支持 `previous_response_id` 进行 O(1) 状态恢复，透明兼容 `resp_` 与 `msg_` 标识，并支持滑动 TTL 与 LRU 淘汰
+- 原生工具与混合工具支持：支持 `googleSearch`、`codeExecution`、`urlContext` 与 `functionDeclarations` 原生组合及真正的 SSE 流式传输
+- Strict 混合工具调度与 `pause_turn`：支持 `VERTEX_AGENT_TOOL_MODE=strict` 状态挂起/恢复、输入冲突防护与自主迭代上限控制
 - Vertex 原生 REST 入口 /vertex/v1/* 和 /vertex/v1beta1/*
 - 自动读取 GOOGLE_CLOUD_PROJECT 与 VERTEX_LOCATION
 - ADC Token 提前刷新；上游返回 401 时强制刷新并重试一次
@@ -230,6 +234,8 @@ https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LO
 | --- | ---: | --- |
 | `VERTEX_PROXY_API_KEY` | 未设置 | 设置后要求请求携带 `Authorization: Bearer ...` 或 `X-API-Key` 请求头 |
 | `VERTEX_MODELS` | 空 | `/v1/models` 接口返回的逗号分隔的模型列表 |
+| `VERTEX_AGENT_TOOL_MODE` | `best_effort` | 代理工具调度模式：`best_effort`（直接组合 Native 工具）或 `strict`（严格混合工具状态机与挂起） |
+| `VERTEX_AGENT_MAX_ITERATIONS` | `5` | Strict 模式下服务侧自主迭代轮次上限，超限触发 `pause_turn` |
 | `VERTEX_ANTHROPIC_BACKEND` | `claude` | `/v1/messages` 的后端：`gemini` 启用协议转换，`claude` 使用 Vertex Claude 直通 |
 | `VERTEX_ANTHROPIC_GEMINI_MODEL` | 空 | Gemini 转换模式实际调用的模型；未设置时选取 `VERTEX_MODELS` 中第一个 Gemini 模型 |
 | `VERTEX_ANTHROPIC_MODEL_MAP` | 空 | Anthropic 客户端模型名到 Google Cloud Claude 模型 ID 的逗号分隔映射 |

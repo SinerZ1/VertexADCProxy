@@ -8,6 +8,30 @@ from typing import Any, AsyncIterator, Mapping
 
 import httpx
 
+from vertex_proxy.agent_ir import (
+    AgentEvent,
+    AgentEventKind,
+    AgentRequest,
+    AgentResponse,
+    AgentStopReason,
+    AgentTool,
+    AgentToolChoice,
+    BackendKind,
+    ToolChoiceMode,
+    ToolExecution,
+    ToolKind,
+    parse_openai_tool,
+)
+from vertex_proxy.agent_state import (
+    InMemoryAgentStateStore,
+    PendingServerToolState,
+    ProviderTurnState,
+    ResponseState,
+    ToolCallState,
+    VertexNativeState,
+    VertexOpenAIState,
+)
+from vertex_proxy.vertex_native import GeminiNativeCodec
 
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -633,69 +657,495 @@ async def _stream_chat_completions_as_responses(
     yield b"data: [DONE]\n\n"
 
 
-class OpenAIResponsesAdapter:
-    """Adapts OpenAI Responses API (/v1/responses) requests to Vertex OpenAI Chat Completions API."""
+def responses_to_agent_request(payload: Mapping[str, Any]) -> AgentRequest:
+    client_model = payload.get("model")
+    if not isinstance(client_model, str) or not client_model.strip():
+        raise ValueError("缺少有效的 model 字段")
 
-    def __init__(self) -> None:
-        self.client_model = ""
-        self.stream = False
+    client_model = client_model.strip()
+    model = client_model if "/" in client_model else f"google/{client_model}"
 
-    def prepare(self, body: bytes, config: Any) -> tuple[str, bytes]:
-        from vertex_proxy.app import _ensure_thought_signatures
+    messages: list[dict[str, Any]] = []
+    instructions = payload.get("instructions")
+    instructions_str = instructions.strip() if isinstance(instructions, str) and instructions.strip() else None
 
-        try:
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("请求体必须是有效的 JSON 对象") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("请求体必须是 JSON 对象")
+    input_data = payload.get("input")
+    if isinstance(input_data, str):
+        messages.append({"role": "user", "content": input_data})
+    elif isinstance(input_data, list):
+        for item in input_data:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict):
+                item_type = item.get("type")
+                if "role" in item:
+                    role = item["role"]
+                    if role in {"system", "developer"}:
+                        if not instructions_str and isinstance(item.get("content"), str):
+                            instructions_str = item["content"]
+                        continue
+                    msg = {"role": role, "content": _normalize_input_content(item.get("content"))}
+                    if "tool_calls" in item:
+                        msg["tool_calls"] = item["tool_calls"]
+                    messages.append(msg)
+                elif item_type == "message":
+                    role = item.get("role", "user")
+                    if role in {"system", "developer"}:
+                        continue
+                    messages.append(
+                        {
+                            "role": role,
+                            "content": _normalize_input_content(item.get("content")),
+                        }
+                    )
+                elif item_type == "function_call":
+                    call_id = (
+                        item.get("call_id")
+                        or item.get("id")
+                        or f"call_{secrets.token_hex(8)}"
+                    )
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": item.get("name", ""),
+                                        "arguments": item.get("arguments", "{}"),
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                elif item_type in {"function_call_output", "tool_result"}:
+                    call_id = (
+                        item.get("call_id")
+                        or item.get("tool_call_id")
+                        or item.get("id")
+                    )
+                    out = item.get("output") or item.get("content", "")
+                    content_str = (
+                        out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": content_str,
+                        }
+                    )
 
-        client_model, converted = responses_to_chat_completions(payload)
-        _ensure_thought_signatures(converted)
+    if isinstance(payload.get("messages"), list):
+        for msg in payload["messages"]:
+            if isinstance(msg, dict) and "role" in msg:
+                role = msg["role"]
+                if role in {"system", "developer"}:
+                    if not instructions_str and isinstance(msg.get("content"), str):
+                        instructions_str = msg["content"]
+                    continue
+                m = dict(msg)
+                if "content" in m:
+                    m["content"] = _normalize_input_content(m["content"])
+                messages.append(m)
 
-        self.client_model = client_model
-        self.stream = converted.get("stream") is True
+    # Parse generation config
+    temperature = payload.get("temperature")
+    top_p = payload.get("top_p")
+    max_tokens = (
+        payload.get("max_output_tokens")
+        or payload.get("max_completion_tokens")
+        or payload.get("max_tokens")
+    )
+    response_format = payload.get("response_format")
+    stop = payload.get("stop")
+    stop_sequences = [stop] if isinstance(stop, str) else stop if isinstance(stop, list) else None
 
-        return f"{config.openai_base_url}/chat/completions", _json_bytes(converted)
+    # Convert tools to AgentTool (do not swallow UnsupportedToolError / ValueError)
+    agent_tools = []
+    raw_tools = payload.get("tools")
+    if isinstance(raw_tools, list):
+        for t in raw_tools:
+            agent_tools.append(parse_openai_tool(t))
 
-    def response_headers(
-        self,
-        response: httpx.Response,
-        headers: Mapping[str, str],
-    ) -> dict[str, str]:
-        drop_keys = {"content-length", "content-encoding", "transfer-encoding", "content-type"}
-        result = {k: v for k, v in headers.items() if k.lower() not in drop_keys}
-        if response.status_code >= 400:
-            result["content-type"] = (
-                headers.get("content-type") or headers.get("Content-Type") or "application/json"
+    # Parse Tool Choice
+    raw_choice = payload.get("tool_choice")
+    choice = AgentToolChoice(ToolChoiceMode.AUTO)
+    if isinstance(raw_choice, str):
+        if raw_choice == "none":
+            choice = AgentToolChoice(ToolChoiceMode.NONE)
+        elif raw_choice == "required":
+            choice = AgentToolChoice(ToolChoiceMode.REQUIRED)
+    elif isinstance(raw_choice, dict):
+        fn = raw_choice.get("function", {})
+        if fn.get("name"):
+            choice = AgentToolChoice(ToolChoiceMode.SPECIFIC, specific_tool=fn["name"])
+
+    parallel_tool_calls = payload.get("parallel_tool_calls", True)
+
+    return AgentRequest(
+        model=model,
+        messages=messages,
+        instructions=instructions_str,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+        response_format=response_format,
+        tools=agent_tools,
+        tool_choice=choice,
+        parallel_tool_calls=parallel_tool_calls,
+        previous_response_id=payload.get("previous_response_id"),
+        reasoning=payload.get("reasoning") or payload.get("encrypted_content"),
+        metadata={"client_model": client_model, "stream": payload.get("stream") is True}
+    )
+
+
+async def unary_responses_event(events_gen: AsyncIterator[AgentEvent], client_model: str) -> tuple[dict[str, Any], dict[str, str]]:
+    response_id = f"resp_{secrets.token_hex(12)}"
+    created_at = int(datetime.now(timezone.utc).timestamp())
+    output_items: list[dict[str, Any]] = []
+    text_content = ""
+    usage_dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    status = "completed"
+    error_msg = None
+    resp_headers: dict[str, str] = {}
+
+    async for event in events_gen:
+        if event.kind == AgentEventKind.RESPONSE_STARTED:
+            response_id = event.data.get("response_id", response_id)
+        elif event.kind == AgentEventKind.TEXT_DELTA:
+            text_content += event.data.get("text", "")
+        elif event.kind == AgentEventKind.TOOL_STARTED:
+            if event.tool_kind == ToolKind.WEB_SEARCH:
+                ws_id = event.item_id or f"ws_{secrets.token_hex(8)}"
+                query = event.data.get("query", "web search")
+                sources = event.data.get("sources", [])
+                output_items.append({
+                    "id": ws_id,
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "query": query,
+                    "results": sources,
+                })
+            else:
+                tool_calls = event.data.get("tool_calls", [])
+                for tc in tool_calls:
+                    call_id = tc.get("id") or tc.get("call_id") or f"call_{secrets.token_hex(8)}"
+                    fn = tc.get("function", {})
+                    output_items.append({
+                        "id": call_id,
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": fn.get("name", ""),
+                        "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False)
+                    })
+        elif event.kind == AgentEventKind.COMPLETED:
+            if "id" in event.data and event.data["id"]:
+                response_id = event.data["id"]
+            if "headers" in event.data and isinstance(event.data["headers"], dict):
+                resp_headers = {k: v for k, v in event.data["headers"].items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}}
+            if "usage" in event.data:
+                u = event.data["usage"]
+                usage_dict = {
+                    "input_tokens": u.get("prompt_tokens", 0),
+                    "output_tokens": u.get("completion_tokens", 0),
+                    "total_tokens": u.get("total_tokens", 0)
+                }
+            if "stop_reason" in event.data:
+                sr = event.data["stop_reason"]
+                if hasattr(sr, "value") and sr.value in {"pause_turn", "max_tokens"}:
+                    status = "incomplete"
+                elif sr in {"pause_turn", "max_tokens"}:
+                    status = "incomplete"
+        elif event.kind == AgentEventKind.ERROR:
+            status = "failed"
+            error_msg = event.data.get("message")
+            if event.data.get("status_code") == 400:
+                raise ValueError(error_msg)
+
+    if text_content:
+        output_items.insert(0, {
+            "id": f"msg_{secrets.token_hex(12)}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text_content}]
+        })
+
+    res_body = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "completed_at": created_at,
+        "status": status,
+        "model": client_model,
+        "output": output_items,
+        "usage": usage_dict
+    }
+    if error_msg:
+        res_body["error"] = {"message": error_msg}
+    return res_body, resp_headers
+
+
+async def stream_responses_events(events_gen: AsyncIterator[AgentEvent], client_model: str) -> AsyncIterator[bytes]:
+    response_id = f"resp_{secrets.token_hex(12)}"
+    created_at = int(datetime.now(timezone.utc).timestamp())
+    final_output: list[dict[str, Any]] = []
+
+    msg_id = f"msg_{secrets.token_hex(12)}"
+    text_started = False
+    accumulated_text = ""
+    next_output_index = 0
+    text_output_index = 0
+    tool_calls: dict[int, dict[str, Any]] = {}
+    usage_dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    started_emitted = False
+
+    def make_in_progress_obj(rid: str) -> dict[str, Any]:
+        return {
+            "id": rid,
+            "object": "response",
+            "created_at": created_at,
+            "completed_at": None,
+            "status": "in_progress",
+            "model": client_model,
+            "output": [],
+            "error": None,
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "usage": None,
+        }
+
+    completed_status = "completed"
+    async for event in events_gen:
+        if event.kind == AgentEventKind.RESPONSE_STARTED:
+            response_id = event.data.get("response_id", response_id)
+            if not started_emitted:
+                resp_obj = make_in_progress_obj(response_id)
+                yield _sse("response.created", {"type": "response.created", "response": resp_obj})
+                yield _sse("response.in_progress", {"type": "response.in_progress", "response": resp_obj})
+                started_emitted = True
+            continue
+
+        if not started_emitted:
+            resp_obj = make_in_progress_obj(response_id)
+            yield _sse("response.created", {"type": "response.created", "response": resp_obj})
+            yield _sse("response.in_progress", {"type": "response.in_progress", "response": resp_obj})
+            started_emitted = True
+
+        if event.kind == AgentEventKind.TEXT_DELTA:
+            text_delta = event.data.get("text", "")
+            if text_delta:
+                if not text_started:
+                    text_started = True
+                    text_output_index = next_output_index
+                    next_output_index += 1
+                    yield _sse(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": text_output_index,
+                            "item": {
+                                "id": msg_id,
+                                "type": "message",
+                                "status": "in_progress",
+                                "role": "assistant",
+                                "content": [],
+                            },
+                        },
+                    )
+                accumulated_text += text_delta
+                yield _sse(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": msg_id,
+                        "output_index": text_output_index,
+                        "content_index": 0,
+                        "delta": text_delta,
+                        "logprobs": [],
+                    },
+                )
+        elif event.kind == AgentEventKind.TOOL_STARTED and event.tool_kind == ToolKind.WEB_SEARCH:
+            ws_id = event.item_id or f"ws_{secrets.token_hex(8)}"
+            ws_idx = next_output_index
+            next_output_index += 1
+            query = event.data.get("query", "web search")
+            sources = event.data.get("sources", [])
+            yield _sse(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": ws_idx,
+                    "item": {
+                        "id": ws_id,
+                        "type": "web_search_call",
+                        "status": "in_progress",
+                        "query": query,
+                    },
+                },
             )
-            return result
-        result["content-type"] = (
-            "text/event-stream; charset=utf-8"
-            if self.stream
-            else "application/json; charset=utf-8"
+            yield _sse("response.web_search_call.in_progress", {"type": "response.web_search_call.in_progress", "output_index": ws_idx, "call_id": ws_id})
+            yield _sse("response.web_search_call.searching", {"type": "response.web_search_call.searching", "output_index": ws_idx, "call_id": ws_id})
+            yield _sse("response.web_search_call.completed", {"type": "response.web_search_call.completed", "output_index": ws_idx, "call_id": ws_id, "results": sources})
+            ws_item = {
+                "id": ws_id,
+                "type": "web_search_call",
+                "status": "completed",
+                "query": query,
+                "results": sources,
+            }
+            yield _sse(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": ws_idx,
+                    "item": ws_item,
+                },
+            )
+            final_output.append(ws_item)
+        elif event.kind == AgentEventKind.TOOL_STARTED:
+            tcs = event.data.get("tool_calls", [])
+            for tc in tcs:
+                idx = len(tool_calls)
+                call_id = tc.get("id") or tc.get("call_id") or f"call_{secrets.token_hex(8)}"
+                fn = tc.get("function", {})
+                out_idx = next_output_index
+                next_output_index += 1
+                tool_calls[idx] = {
+                    "id": call_id,
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments", {}), ensure_ascii=False),
+                    "output_index": out_idx
+                }
+                yield _sse(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": out_idx,
+                        "item": {
+                            "id": call_id,
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "call_id": call_id,
+                            "name": fn.get("name", ""),
+                            "arguments": "",
+                        },
+                    },
+                )
+                yield _sse(
+                    "response.function_call_arguments.delta",
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": call_id,
+                        "output_index": out_idx,
+                        "call_id": call_id,
+                        "delta": tool_calls[idx]["arguments"],
+                    },
+                )
+        elif event.kind == AgentEventKind.COMPLETED:
+            if "id" in event.data and event.data["id"]:
+                response_id = event.data["id"]
+            if "usage" in event.data:
+                u = event.data["usage"]
+                usage_dict = {
+                    "input_tokens": u.get("prompt_tokens", 0),
+                    "output_tokens": u.get("completion_tokens", 0),
+                    "total_tokens": u.get("total_tokens", 0)
+                }
+            if "stop_reason" in event.data:
+                sr = event.data["stop_reason"]
+                if hasattr(sr, "value") and sr.value in {"pause_turn", "max_tokens"}:
+                    completed_status = "incomplete"
+                elif sr in {"pause_turn", "max_tokens"}:
+                    completed_status = "incomplete"
+        elif event.kind == AgentEventKind.ERROR:
+            err_msg = event.data.get("message", "Error")
+            yield _sse("error", {"type": "error", "error": {"message": err_msg}})
+            return
+
+    if not started_emitted:
+        resp_obj = make_in_progress_obj(response_id)
+        yield _sse("response.created", {"type": "response.created", "response": resp_obj})
+        yield _sse("response.in_progress", {"type": "response.in_progress", "response": resp_obj})
+
+    if text_started:
+        yield _sse(
+            "response.output_text.done",
+            {
+                "type": "response.output_text.done",
+                "item_id": msg_id,
+                "output_index": text_output_index,
+                "content_index": 0,
+                "text": accumulated_text,
+                "logprobs": [],
+            },
         )
-        return result
+        msg_item = {
+            "id": msg_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": accumulated_text}],
+        }
+        yield _sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": text_output_index,
+                "item": msg_item,
+            },
+        )
+        final_output.append(msg_item)
 
-    async def transform(self, response: httpx.Response) -> AsyncIterator[bytes]:
-        if response.status_code >= 400:
-            async for chunk in response.aiter_raw():
-                yield chunk
-            return
-        if self.stream:
-            async for chunk in _stream_chat_completions_as_responses(
-                response, self.client_model
-            ):
-                yield chunk
-            return
+    for _, entry in sorted(tool_calls.items()):
+        yield _sse(
+            "response.function_call_arguments.done",
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": entry["id"],
+                "output_index": entry["output_index"],
+                "call_id": entry["id"],
+                "arguments": entry["arguments"],
+            },
+        )
+        fn_item = {
+            "id": entry["id"],
+            "type": "function_call",
+            "status": "completed",
+            "call_id": entry["id"],
+            "name": entry["name"],
+            "arguments": entry["arguments"],
+        }
+        yield _sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "output_index": entry["output_index"],
+                "item": fn_item,
+            },
+        )
+        final_output.append(fn_item)
 
-        body = await response.aread()
-        try:
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            yield body
-            return
-        if not isinstance(payload, dict):
-            yield body
-            return
-        yield _json_bytes(chat_completions_to_responses(payload, self.client_model))
+    completed_at = int(datetime.now(timezone.utc).timestamp())
+    yield _sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "completed_at": completed_at,
+                "status": completed_status,
+                "model": client_model,
+                "output": final_output,
+                "usage": usage_dict,
+            },
+        },
+    )
+    yield b"data: [DONE]\n\n"

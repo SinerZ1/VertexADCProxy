@@ -9,6 +9,16 @@ from typing import Any
 
 import httpx
 
+from vertex_proxy.agent_ir import (
+    AgentEvent,
+    AgentEventKind,
+    AgentRequest,
+    AgentToolChoice,
+    ToolChoiceMode,
+    ToolKind,
+    parse_anthropic_tool,
+)
+
 
 _SAFE_GEMINI_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VERTEX_SCHEMA_FIELDS = {
@@ -922,3 +932,302 @@ class GeminiCountTokensAdapter:
         if not isinstance(total_tokens, int):
             total_tokens = payload.get("total_tokens", 0)
         yield _json_bytes({"input_tokens": total_tokens})
+
+
+def anthropic_to_agent_request(payload: Mapping[str, Any], config: Any) -> AgentRequest:
+    client_model = payload.get("model")
+    if not isinstance(client_model, str) or not client_model.strip():
+        raise ValueError("缺少有效的 model 字段")
+
+    client_model = client_model.strip()
+    target_gemini = resolve_gemini_model(client_model, config)
+    model = target_gemini if "/" in target_gemini else f"google/{target_gemini}"
+
+    messages: list[dict[str, Any]] = []
+
+    instructions = _system_text(payload.get("system"))
+
+    raw_messages = payload.get("messages", [])
+    if isinstance(raw_messages, list):
+        for msg in raw_messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "user":
+                messages.extend(_user_messages(msg.get("content", "")))
+            elif role in {"assistant", "model"}:
+                messages.append(_assistant_message(msg.get("content", "")))
+            elif role in {"system", "developer"}:
+                text = _system_text(msg.get("content", ""))
+                if text and not instructions:
+                    instructions = text
+            elif role == "tool":
+                tool_call_id = msg.get("tool_call_id") or msg.get("tool_use_id")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    raise ValueError("tool 消息缺少 tool_call_id")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": _tool_result_text(msg.get("content")),
+                    }
+                )
+
+    agent_tools = []
+    raw_tools = payload.get("tools")
+    if isinstance(raw_tools, list):
+        for t in raw_tools:
+            agent_tools.append(parse_anthropic_tool(t))
+
+    raw_choice = payload.get("tool_choice")
+    choice = AgentToolChoice(ToolChoiceMode.AUTO)
+    if isinstance(raw_choice, dict):
+        choice_type = raw_choice.get("type")
+        if choice_type == "none":
+            choice = AgentToolChoice(ToolChoiceMode.NONE)
+        elif choice_type == "any":
+            choice = AgentToolChoice(ToolChoiceMode.REQUIRED)
+        elif choice_type == "tool" and isinstance(raw_choice.get("name"), str):
+            choice = AgentToolChoice(ToolChoiceMode.SPECIFIC, specific_tool=raw_choice["name"])
+
+    temperature = payload.get("temperature")
+    top_p = payload.get("top_p")
+    max_tokens = payload.get("max_tokens")
+    stop_sequences = payload.get("stop_sequences")
+
+    return AgentRequest(
+        model=model,
+        messages=messages,
+        instructions=instructions if instructions and instructions.strip() else None,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+        tools=agent_tools,
+        tool_choice=choice,
+        parallel_tool_calls=not bool(isinstance(raw_choice, dict) and raw_choice.get("disable_parallel_tool_use")),
+        previous_response_id=payload.get("previous_response_id"),
+        metadata={"client_model": client_model, "stream": payload.get("stream") is True}
+    )
+
+
+async def unary_anthropic_event(events_gen: AsyncIterator[AgentEvent], client_model: str) -> tuple[dict[str, Any], dict[str, str]]:
+    message_id = f"msg_{secrets.token_hex(12)}"
+    content_blocks: list[dict[str, Any]] = []
+    text_content = ""
+    stop_reason = "end_turn"
+    usage_dict = {"input_tokens": 0, "output_tokens": 0}
+    resp_headers: dict[str, str] = {}
+
+    async for event in events_gen:
+        if event.kind == AgentEventKind.RESPONSE_STARTED:
+            if "response_id" in event.data:
+                message_id = f"msg_{event.data['response_id'].removeprefix('resp_')}"
+        elif event.kind == AgentEventKind.TEXT_DELTA:
+            text_content += event.data.get("text", "")
+        elif event.kind == AgentEventKind.TOOL_STARTED:
+            if event.tool_kind != ToolKind.WEB_SEARCH:
+                stop_reason = "tool_use"
+                tcs = event.data.get("tool_calls", [])
+                for tc in tcs:
+                    call_id = tc.get("id") or tc.get("call_id") or f"toolu_{secrets.token_hex(12)}"
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {"value": args}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": fn.get("name", ""),
+                        "input": args
+                    })
+        elif event.kind == AgentEventKind.COMPLETED:
+            if "headers" in event.data and isinstance(event.data["headers"], dict):
+                resp_headers = {k: v for k, v in event.data["headers"].items() if k.lower() not in {"content-length", "content-encoding", "transfer-encoding"}}
+            if "usage" in event.data:
+                u = event.data["usage"]
+                usage_dict = {
+                    "input_tokens": u.get("prompt_tokens", 0),
+                    "output_tokens": u.get("completion_tokens", 0),
+                }
+            if "stop_reason" in event.data:
+                sr = event.data["stop_reason"]
+                if hasattr(sr, "value"):
+                    val = sr.value
+                    if val == "tool_use":
+                        stop_reason = "tool_use"
+                    elif val == "pause_turn":
+                        stop_reason = "pause_turn"
+                    elif val == "max_tokens":
+                        stop_reason = "max_tokens"
+                    elif val == "refusal":
+                        stop_reason = "refusal"
+                    else:
+                        stop_reason = "end_turn"
+                elif isinstance(sr, str):
+                    stop_reason = sr
+        elif event.kind == AgentEventKind.ERROR:
+            err_msg = event.data.get("message", "Error")
+            if event.data.get("status_code") == 400:
+                raise ValueError(err_msg)
+
+    if text_content:
+        content_blocks.insert(0, {"type": "text", "text": text_content})
+
+    res_body = {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": client_model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": usage_dict,
+    }
+    return res_body, resp_headers
+
+
+async def stream_anthropic_events(events_gen: AsyncIterator[AgentEvent], client_model: str) -> AsyncIterator[bytes]:
+    message_id = f"msg_{secrets.token_hex(12)}"
+    started_emitted = False
+    text_started = False
+    next_block_index = 0
+    output_tokens = 0
+    stop_reason = "end_turn"
+
+    def make_start_msg(mid: str) -> dict[str, Any]:
+        return {
+            "type": "message_start",
+            "message": {
+                "id": mid,
+                "type": "message",
+                "role": "assistant",
+                "model": client_model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        }
+
+    async for event in events_gen:
+        if event.kind == AgentEventKind.RESPONSE_STARTED:
+            if "response_id" in event.data:
+                message_id = f"msg_{event.data['response_id'].removeprefix('resp_')}"
+            if not started_emitted:
+                yield _sse("message_start", make_start_msg(message_id))
+                started_emitted = True
+            continue
+
+        if not started_emitted:
+            yield _sse("message_start", make_start_msg(message_id))
+            started_emitted = True
+
+        if event.kind == AgentEventKind.TEXT_DELTA:
+            text_delta = event.data.get("text", "")
+            if text_delta:
+                if not text_started:
+                    text_started = True
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": next_block_index,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    )
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": next_block_index,
+                        "delta": {"type": "text_delta", "text": text_delta},
+                    },
+                )
+        elif event.kind == AgentEventKind.TOOL_STARTED and event.tool_kind != ToolKind.WEB_SEARCH:
+            stop_reason = "tool_use"
+            if text_started:
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": next_block_index})
+                next_block_index += 1
+                text_started = False
+
+            tcs = event.data.get("tool_calls", [])
+            for tc in tcs:
+                call_id = tc.get("id") or tc.get("call_id") or f"toolu_{secrets.token_hex(12)}"
+                fn = tc.get("function", {})
+                args = fn.get("arguments", "{}")
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
+
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": next_block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": fn.get("name", ""),
+                            "input": {},
+                        },
+                    },
+                )
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": next_block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": args,
+                        },
+                    },
+                )
+                yield _sse("content_block_stop", {"type": "content_block_stop", "index": next_block_index})
+                next_block_index += 1
+
+        elif event.kind == AgentEventKind.COMPLETED:
+            if "usage" in event.data:
+                output_tokens = event.data["usage"].get("completion_tokens", 0)
+            if "stop_reason" in event.data:
+                sr = event.data["stop_reason"]
+                if hasattr(sr, "value"):
+                    val = sr.value
+                    if val == "tool_use":
+                        stop_reason = "tool_use"
+                    elif val == "pause_turn":
+                        stop_reason = "pause_turn"
+                    elif val == "max_tokens":
+                        stop_reason = "max_tokens"
+                    elif val == "refusal":
+                        stop_reason = "refusal"
+                    else:
+                        stop_reason = "end_turn"
+                elif isinstance(sr, str):
+                    stop_reason = sr
+        elif event.kind == AgentEventKind.ERROR:
+            err_msg = event.data.get("message", "Error")
+            yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": err_msg}})
+            return
+
+    if not started_emitted:
+        yield _sse("message_start", make_start_msg(message_id))
+
+    if text_started:
+        yield _sse("content_block_stop", {"type": "content_block_stop", "index": next_block_index})
+
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+            },
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    yield _sse("message_stop", {"type": "message_stop"})
