@@ -15,6 +15,10 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, QEvent, Qt
 from PyQt6.QtGui import QAction, QIcon, QIntValidator, QStandardItemModel, QStandardItem
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
+# Unique identifier for single-instance IPC
+SINGLE_INSTANCE_KEY = "vertex_adc_proxy_single_instance_gui_lock"
 
 # Logger setup
 LOGGER = logging.getLogger("vertex_proxy_gui")
@@ -652,6 +656,7 @@ class VertexProxyApp(QMainWindow):
         super().__init__()
         self.server_thread = None
         self.test_thread = None
+        self.single_instance_server: QLocalServer | None = None
         self.log_signaler = LogSignaler()
         self.log_signaler.log_written.connect(self.append_log)
         
@@ -1290,9 +1295,24 @@ class VertexProxyApp(QMainWindow):
             self.show_normal_window()
 
     def show_normal_window(self):
+        self.bring_to_front()
+
+    def bring_to_front(self):
+        """Brings the main window to the foreground, restoring from tray or minimized state."""
+        if self.isMinimized():
+            self.showNormal()
         self.show()
-        self.activateWindow()
         self.raise_()
+        self.activateWindow()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self.winId())
+                # SW_RESTORE = 9
+                ctypes.windll.user32.ShowWindow(hwnd, 9)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception as e:
+                LOGGER.debug("Failed to set foreground window via Win32 API: %s", e)
 
     def show_tray_message(self, title: str, body: str):
         if self.tray_icon and self.tray_icon.isVisible():
@@ -1312,9 +1332,58 @@ class VertexProxyApp(QMainWindow):
         if self.server_thread and self.server_thread.isRunning():
             self.server_thread.stop()
             self.server_thread.wait(2000)
-        self.tray_icon.hide()
+        if self.single_instance_server:
+            self.single_instance_server.close()
+            self.single_instance_server = None
+        if hasattr(self, "tray_icon") and self.tray_icon:
+            self.tray_icon.hide()
         QApplication.quit()
         sys.exit(0)
+
+
+def activate_existing_instance(key: str = SINGLE_INSTANCE_KEY) -> bool:
+    """Attempts to connect to an already running instance.
+
+    If successful, sends an activation signal to wake up the existing instance
+    and returns True. Otherwise returns False.
+    """
+    socket = QLocalSocket()
+    socket.connectToServer(key)
+    if socket.waitForConnected(500):
+        try:
+            socket.write(b"ACTIVATE\n")
+            socket.waitForBytesWritten(500)
+        finally:
+            socket.disconnectFromServer()
+        return True
+    return False
+
+
+def setup_single_instance_server(window: VertexProxyApp, key: str = SINGLE_INSTANCE_KEY) -> QLocalServer:
+    """Sets up QLocalServer to listen for wake-up calls from secondary instances."""
+    server = QLocalServer()
+    # Remove stale socket/pipe from prior crash if needed
+    server.removeServer(key)
+    server.listen(key)
+
+    def on_new_connection():
+        client_socket = server.nextPendingConnection()
+        if client_socket:
+            def on_ready_read():
+                try:
+                    data = bytes(client_socket.readAll()).decode("utf-8", errors="ignore")
+                    if "ACTIVATE" in data:
+                        window.bring_to_front()
+                except Exception:
+                    pass
+
+            client_socket.readyRead.connect(on_ready_read)
+            client_socket.disconnected.connect(client_socket.deleteLater)
+            # Wake up window immediately on connection as well
+            window.bring_to_front()
+
+    server.newConnection.connect(on_new_connection)
+    return server
 
 
 def setup_logging(signaler: LogSignaler):
@@ -1341,9 +1410,16 @@ def main():
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False) # Keep running when window is closed (hidden in tray)
+    
+    # Single-instance check: if already running, bring existing window to front and exit
+    if activate_existing_instance():
+        LOGGER.info("Another instance is already running. Activated existing window and exiting.")
+        sys.exit(0)
+
+    app.setQuitOnLastWindowClosed(False)  # Keep running when window is closed (hidden in tray)
     
     window = VertexProxyApp()
+    window.single_instance_server = setup_single_instance_server(window)
     window.show()
     sys.exit(app.exec())
 
