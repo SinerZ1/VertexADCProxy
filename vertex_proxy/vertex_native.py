@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
+LOGGER = logging.getLogger("vertex_proxy.native")
 
 from vertex_proxy.agent_ir import (
     AgentEvent,
@@ -28,6 +31,29 @@ class ProviderCapabilities:
 def _to_native_parameters(parameters: Any) -> Dict[str, Any]:
     return _vertex_function_schema(parameters)
 
+
+def _normalize_safety_settings(settings: Any) -> list[Dict[str, str]] | None:
+    if not settings:
+        return None
+    if isinstance(settings, (list, tuple)):
+        normalized = []
+        for item in settings:
+            if isinstance(item, dict) and "category" in item and "threshold" in item:
+                normalized.append({
+                    "category": str(item["category"]),
+                    "threshold": str(item["threshold"]),
+                })
+        return normalized or None
+    if isinstance(settings, dict):
+        normalized = [
+            {"category": str(cat), "threshold": str(thresh)}
+            for cat, thresh in settings.items()
+            if isinstance(cat, str) and isinstance(thresh, str)
+        ]
+        return normalized or None
+    return None
+
+
 class GeminiNativeCodec:
     @staticmethod
     def encode_request(
@@ -38,6 +64,8 @@ class GeminiNativeCodec:
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         system_instruction: Optional[str] = None,
+        safety_settings: Optional[Any] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         native_tools = []
         client_functions = []
@@ -92,24 +120,83 @@ class GeminiNativeCodec:
         if native_tools:
             native_payload["tools"] = native_tools
 
+        normalized_safety = _normalize_safety_settings(safety_settings)
+        if normalized_safety:
+            native_payload["safetySettings"] = normalized_safety
+            log_id = f"[{request_id}] " if request_id else ""
+            LOGGER.info(
+                "%sSafety settings applied (%d categories): %s",
+                log_id,
+                len(normalized_safety),
+                json.dumps(normalized_safety, ensure_ascii=False),
+            )
+        else:
+            log_id = f"[{request_id}] " if request_id else ""
+            LOGGER.info("%sSafety settings: None (using upstream defaults)", log_id)
+
         return native_payload
 
     @staticmethod
     def decode_response(
         native_resp: Dict[str, Any],
         model: str,
+        request_id: Optional[str] = None,
     ) -> AgentResponse:
         response_id = f"resp_{secrets.token_hex(16)}"
         candidates = native_resp.get("candidates", [])
         output_items = []
         stop_reason = AgentStopReason.END_TURN
+        log_id = f"[{request_id}] " if request_id else ""
+
+        prompt_feedback = native_resp.get("promptFeedback")
+        if not candidates and isinstance(prompt_feedback, dict) and prompt_feedback.get("blockReason"):
+            block_reason = prompt_feedback.get("blockReason")
+            block_msg = prompt_feedback.get("blockReasonMessage")
+            safety_ratings = prompt_feedback.get("safetyRatings", [])
+            stop_reason = AgentStopReason.PROMPT_BLOCKED
+            LOGGER.warning(
+                "%sGemini prompt blocked (input-side): blockReason=%s, message=%s, safetyRatings=%s",
+                log_id,
+                block_reason,
+                block_msg,
+                safety_ratings,
+            )
 
         for candidate in candidates:
             finish_reason = candidate.get("finishReason")
+            candidate_ratings = candidate.get("safetyRatings", [])
             if finish_reason == "MAX_TOKENS":
                 stop_reason = AgentStopReason.MAX_TOKENS
-            elif finish_reason == "SAFETY" or finish_reason == "RECITATION":
+            elif finish_reason in {"SAFETY", "RECITATION"}:
                 stop_reason = AgentStopReason.REFUSAL
+                LOGGER.warning(
+                    "%sGemini generation blocked (output-side): finishReason=%s, safetyRatings=%s",
+                    log_id,
+                    finish_reason,
+                    candidate_ratings,
+                )
+            elif finish_reason == "PROHIBITED_CONTENT":
+                stop_reason = AgentStopReason.PROHIBITED_CONTENT
+                LOGGER.warning(
+                    "%sGemini generation blocked (output-side): finishReason=PROHIBITED_CONTENT, safetyRatings=%s",
+                    log_id,
+                    candidate_ratings,
+                )
+            elif finish_reason == "OTHER":
+                stop_reason = AgentStopReason.OTHER
+                LOGGER.warning(
+                    "%sGemini generation blocked (output-side): finishReason=OTHER, safetyRatings=%s",
+                    log_id,
+                    candidate_ratings,
+                )
+            elif finish_reason and finish_reason != "STOP":
+                stop_reason = AgentStopReason.REFUSAL
+                LOGGER.warning(
+                    "%sGemini generation stopped (output-side): finishReason=%s, safetyRatings=%s",
+                    log_id,
+                    finish_reason,
+                    candidate_ratings,
+                )
 
             content = candidate.get("content", {})
             parts = content.get("parts", [])

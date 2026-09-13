@@ -1,8 +1,16 @@
+import asyncio
 import json
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from vertex_proxy.app import Settings, create_app
+from vertex_proxy.agent_ir import AgentEvent, AgentEventKind, AgentStopReason
+from vertex_proxy.openai_responses import (
+    chat_completions_to_responses,
+    unary_responses_event,
+    stream_responses_events,
+)
 from tests.test_app import AsyncBytes, FakeCredentials
 
 
@@ -293,4 +301,40 @@ def test_openai_responses_headers_cleanup() -> None:
     assert res.headers.get("content-length") != str(len(compressed_data))
     assert res.headers["content-type"] == "text/event-stream; charset=utf-8"
     assert "event: response.created" in res.text
+
+
+def test_openai_responses_chat_completions_to_responses_filter_mappings() -> None:
+    for reason in ["content_filter", "safety", "prohibited_content", "other", "prompt_blocked"]:
+        payload = {
+            "id": "chatcmpl-test",
+            "choices": [{"finish_reason": reason, "message": {"content": ""}}],
+        }
+        res = chat_completions_to_responses(payload, "gemini-2.5-flash")
+        assert res["status"] == "failed"
+
+
+def test_openai_responses_events_stop_reason_handling() -> None:
+    async def _test():
+        async def mock_events_prompt_blocked():
+            yield AgentEvent(kind=AgentEventKind.RESPONSE_STARTED, data={"response_id": "resp_123"})
+            yield AgentEvent(kind=AgentEventKind.COMPLETED, data={"id": "resp_123", "stop_reason": AgentStopReason.PROMPT_BLOCKED})
+
+        res_json, _ = await unary_responses_event(mock_events_prompt_blocked(), "gemini-2.5-flash")
+        assert res_json["status"] == "failed"
+
+        async def mock_events_prohibited():
+            yield AgentEvent(kind=AgentEventKind.RESPONSE_STARTED, data={"response_id": "resp_456"})
+            yield AgentEvent(kind=AgentEventKind.COMPLETED, data={"id": "resp_456", "stop_reason": AgentStopReason.PROHIBITED_CONTENT})
+
+        res_json2, _ = await unary_responses_event(mock_events_prohibited(), "gemini-2.5-flash")
+        assert res_json2["status"] == "failed"
+
+        # Streaming
+        chunks = []
+        async for chunk in stream_responses_events(mock_events_prompt_blocked(), "gemini-2.5-flash"):
+            chunks.append(chunk.decode("utf-8"))
+        stream_text = "".join(chunks)
+        assert 'response.failed' in stream_text or 'status": "failed"' in stream_text or '"status":"failed"' in stream_text
+
+    asyncio.run(_test())
 

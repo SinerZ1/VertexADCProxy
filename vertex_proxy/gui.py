@@ -1042,13 +1042,15 @@ class VertexProxyApp(QMainWindow):
         self.set_log_mode(log_mode)
 
     def save_current_settings(self):
+        existing_config = load_config()
         all_models = []
         for i in range(self.cmb_test_model.model().rowCount()):
             item = self.cmb_test_model.model().item(i)
             if item:
                 all_models.append(item.text())
 
-        config = {
+        config = dict(existing_config)
+        config.update({
             "port": int(self.txt_port.text().strip() or "10101"),
             "api_key": self.txt_api_key.text().strip(),
             "project": self.txt_project.text().strip(),
@@ -1060,7 +1062,7 @@ class VertexProxyApp(QMainWindow):
             "log_mode": getattr(self, "_log_mode", "full"),
             "all_models": all_models,
             "selected_models": self.cmb_test_model.checked_items(),
-        }
+        })
         save_config(config)
 
     def set_log_mode(self, mode: str):

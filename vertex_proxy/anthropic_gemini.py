@@ -577,6 +577,12 @@ def _anthropic_stop_reason(finish_reason: Any) -> str:
         return "end_turn"
     if finish_reason in {"content_filter", "safety"}:
         return "refusal"
+    if finish_reason in {"prohibited_content", "PROHIBITED_CONTENT"}:
+        return "prohibited_content"
+    if finish_reason in {"other", "OTHER"}:
+        return "other"
+    if finish_reason in {"prompt_blocked", "PROMPT_BLOCKED"}:
+        return "prompt_blocked"
     return "end_turn"
 
 
@@ -1083,6 +1089,12 @@ async def unary_anthropic_event(events_gen: AsyncIterator[AgentEvent], client_mo
                         stop_reason = "max_tokens"
                     elif val == "refusal":
                         stop_reason = "refusal"
+                    elif val == "prohibited_content":
+                        stop_reason = "prohibited_content"
+                    elif val == "other":
+                        stop_reason = "other"
+                    elif val == "prompt_blocked":
+                        stop_reason = "prompt_blocked"
                     else:
                         stop_reason = "end_turn"
                 elif isinstance(sr, str):
@@ -1222,6 +1234,12 @@ async def stream_anthropic_events(events_gen: AsyncIterator[AgentEvent], client_
                         stop_reason = "max_tokens"
                     elif val == "refusal":
                         stop_reason = "refusal"
+                    elif val == "prohibited_content":
+                        stop_reason = "prohibited_content"
+                    elif val == "other":
+                        stop_reason = "other"
+                    elif val == "prompt_blocked":
+                        stop_reason = "prompt_blocked"
                     else:
                         stop_reason = "end_turn"
                 elif isinstance(sr, str):

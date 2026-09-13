@@ -9,6 +9,7 @@ import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import google.auth
@@ -35,6 +36,12 @@ from vertex_proxy.openai_responses import (
 )
 
 LOGGER = logging.getLogger("vertex_proxy")
+if not LOGGER.handlers and not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+LOGGER.setLevel(logging.INFO)
 _CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 _SAFE_RESOURCE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 _HOP_BY_HOP_HEADERS = {
@@ -68,6 +75,72 @@ def _positive_float(value: str, name: str, *, allow_zero: bool = False) -> float
     return parsed
 
 
+def _normalize_safety_settings(raw: Any) -> tuple[dict[str, str], ...] | None:
+    if not raw:
+        return None
+    normalized: list[dict[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and "category" in item and "threshold" in item:
+                normalized.append({
+                    "category": str(item["category"]),
+                    "threshold": str(item["threshold"]),
+                })
+    elif isinstance(raw, dict):
+        for cat, thresh in raw.items():
+            if isinstance(cat, str) and isinstance(thresh, str):
+                normalized.append({
+                    "category": str(cat),
+                    "threshold": str(thresh),
+                })
+    return tuple(normalized) if normalized else None
+
+
+def _load_safety_settings_from_env_or_config(source: Mapping[str, str]) -> tuple[dict[str, str], ...] | None:
+    raw_env = source.get("VERTEX_SAFETY_SETTINGS")
+    if raw_env:
+        raw_env_str = raw_env.strip()
+        if raw_env_str.startswith("[") or raw_env_str.startswith("{"):
+            try:
+                parsed = json.loads(raw_env_str)
+                return _normalize_safety_settings(parsed)
+            except Exception as exc:
+                LOGGER.warning("Failed to parse VERTEX_SAFETY_SETTINGS JSON: %s", exc)
+        else:
+            p = Path(raw_env_str)
+            if p.exists() and p.is_file():
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return _normalize_safety_settings(
+                        data.get("safety_settings") if isinstance(data, dict) and "safety_settings" in data else data
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed to load safety settings from %s: %s", p, exc)
+
+    config_path_str = source.get("PROXY_CONFIG_FILE") or source.get("VERTEX_PROXY_CONFIG_PATH")
+    candidate_paths: list[Path] = []
+    if config_path_str:
+        candidate_paths.append(Path(config_path_str))
+    else:
+        candidate_paths.append(Path("proxy_config.json"))
+        candidate_paths.append(Path.home() / ".vertex_proxy_config.json")
+
+    for path in candidate_paths:
+        if path.exists() and path.is_file():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and "safety_settings" in data:
+                    res = _normalize_safety_settings(data["safety_settings"])
+                    if res is not None:
+                        return res
+            except Exception as exc:
+                LOGGER.warning("Failed to load config from %s: %s", path, exc)
+
+    return None
+
+
 @dataclass(frozen=True)
 class Settings:
     project: str
@@ -79,6 +152,7 @@ class Settings:
     token_refresh_skew: float = 300.0
     agent_tool_mode: str = "best_effort"
     agent_max_iterations: int = 5
+    safety_settings: tuple[dict[str, str], ...] | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -109,6 +183,8 @@ class Settings:
         if agent_max_iterations < 1:
             agent_max_iterations = 1
 
+        safety_settings = _load_safety_settings_from_env_or_config(source)
+
         return cls(
             project=project,
             location=location,
@@ -126,6 +202,7 @@ class Settings:
             ),
             agent_tool_mode=agent_tool_mode if agent_tool_mode in {"best_effort", "strict"} else "best_effort",
             agent_max_iterations=agent_max_iterations,
+            safety_settings=safety_settings,
         )
 
     @property
@@ -311,7 +388,47 @@ def _log_response(
     resp_headers: Mapping[str, str] | None = None,
     req_info: tuple[Request, str] | None = None,
 ) -> None:
-    is_error = status_code != 200 or "content_filter" in resp_body_str
+    is_blocked = (
+        "content_filter" in resp_body_str
+        or "promptFeedback" in resp_body_str
+        or "PROHIBITED_CONTENT" in resp_body_str
+        or "prompt_blocked" in resp_body_str
+    )
+    is_error = status_code != 200 or is_blocked
+
+    if resp_body_str and is_blocked:
+        try:
+            parsed = json.loads(resp_body_str)
+            if isinstance(parsed, dict):
+                pf = parsed.get("promptFeedback")
+                if isinstance(pf, dict) and pf.get("blockReason"):
+                    LOGGER.warning(
+                        "[%s] Gemini prompt blocked (input-side): blockReason=%s, message=%s, safetyRatings=%s",
+                        req_id,
+                        pf.get("blockReason"),
+                        pf.get("blockReasonMessage"),
+                        pf.get("safetyRatings", []),
+                    )
+                for cand in parsed.get("candidates", []):
+                    fr = cand.get("finishReason")
+                    if fr in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "OTHER"}:
+                        LOGGER.warning(
+                            "[%s] Gemini generation blocked (output-side): finishReason=%s, safetyRatings=%s",
+                            req_id,
+                            fr,
+                            cand.get("safetyRatings", []),
+                        )
+                for ch in parsed.get("choices", []):
+                    fr = ch.get("finish_reason")
+                    if fr in {"content_filter", "safety", "prohibited_content", "other", "prompt_blocked"}:
+                        LOGGER.warning(
+                            "[%s] OpenAI response finish_reason: %s",
+                            req_id,
+                            fr,
+                        )
+        except Exception:
+            pass
+
     if log_mode == "full" or (log_mode == "errors" and is_error):
         if log_mode == "errors" and req_info is not None:
             req, body_str = req_info
@@ -651,7 +768,26 @@ def create_app(
                         if "/" not in model_name:
                             data["model"] = f"google/{model_name}"
                     _ensure_thought_signatures(data)
+                    if config.safety_settings:
+                        safety_list = [dict(s) for s in config.safety_settings]
+                        extra_body = data.setdefault("extra_body", {})
+                        if isinstance(extra_body, dict):
+                            extra_body.setdefault("safetySettings", safety_list)
+                            extra_body.setdefault("safety_settings", safety_list)
+                        data.setdefault("safetySettings", safety_list)
+                        LOGGER.info(
+                            "[%s] Request /v1 safetySettings applied (%d categories): %s",
+                            req_id,
+                            len(safety_list),
+                            json.dumps(safety_list, ensure_ascii=False),
+                        )
+                    else:
+                        LOGGER.info(
+                            "[%s] Request /v1 safetySettings: None (using upstream defaults)",
+                            req_id,
+                        )
                     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    req_body_str = _safe_decode_body(body)
             except Exception as exc:
                 LOGGER.warning("Failed to preprocess request body: %s", exc)
 
@@ -790,6 +926,7 @@ def create_app(
             return _error(400, str(exc), "invalid_request_error")
 
         _log_request(req_id, request, req_body_str, log_mode)
+        agent_req.metadata["request_id"] = req_id
 
         if agent_req.previous_response_id:
             store = request.app.state.agent_state_store
@@ -859,6 +996,7 @@ def create_app(
             return _error(400, str(exc), "invalid_request_error")
 
         _log_request(req_id, request, req_body_str, log_mode)
+        agent_req.metadata["request_id"] = req_id
 
         if agent_req.previous_response_id:
             store = request.app.state.agent_state_store

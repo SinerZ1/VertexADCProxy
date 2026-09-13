@@ -74,6 +74,9 @@ class AgentStopReason(Enum):
     MAX_TOKENS = "max_tokens"
     REFUSAL = "refusal"
     ERROR = "error"
+    PROMPT_BLOCKED = "prompt_blocked"
+    PROHIBITED_CONTENT = "prohibited_content"
+    OTHER = "other"
 
 @dataclass
 class AgentResponse:

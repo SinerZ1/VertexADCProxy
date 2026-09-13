@@ -1,7 +1,10 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from vertex_proxy.app import Settings, create_app
@@ -652,6 +655,173 @@ def test_anthropic_messages_supports_case_insensitive_claude_prefix() -> None:
     res_data = response.json()
     assert res_data["role"] == "assistant"
     assert res_data["content"][0]["text"] == "Hello there!"
+
+
+def test_settings_safety_settings_from_env_json() -> None:
+    # Test list format
+    env = {
+        "GOOGLE_CLOUD_PROJECT": "proj",
+        "VERTEX_LOCATION": "global",
+        "VERTEX_SAFETY_SETTINGS": json.dumps([
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        ]),
+    }
+    s = Settings.from_env(env)
+    assert s.safety_settings == (
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    )
+
+    # Test dict format
+    env_dict = {
+        "GOOGLE_CLOUD_PROJECT": "proj",
+        "VERTEX_LOCATION": "global",
+        "VERTEX_SAFETY_SETTINGS": json.dumps({
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_ONLY_HIGH",
+        }),
+    }
+    s_dict = Settings.from_env(env_dict)
+    assert s_dict.safety_settings == (
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"},
+    )
+
+    # Test unconfigured
+    env_unconfigured = {
+        "GOOGLE_CLOUD_PROJECT": "proj",
+        "VERTEX_LOCATION": "global",
+    }
+    s_unconf = Settings.from_env(env_unconfigured)
+    assert s_unconf.safety_settings is None
+
+
+def test_settings_safety_settings_from_config_file(tmp_path: Any) -> None:
+    cfg = tmp_path / "proxy_config.json"
+    cfg.write_text(json.dumps({
+        "safety_settings": [
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"}
+        ]
+    }), encoding="utf-8")
+
+    env = {
+        "GOOGLE_CLOUD_PROJECT": "proj",
+        "VERTEX_LOCATION": "global",
+        "PROXY_CONFIG_FILE": str(cfg),
+    }
+    s = Settings.from_env(env)
+    assert s.safety_settings == (
+        {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+    )
+
+
+def test_openai_proxy_chat_completions_injects_safety_settings_and_logs(caplog: pytest.LogCaptureFixture) -> None:
+    credentials = FakeCredentials()
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, stream=AsyncBytes(b'{"choices": [{"message": {"content": "Hello"}}]}'))
+
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        safety_settings=(
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        ),
+    )
+    app = create_app(settings, credentials=credentials, upstream_transport=httpx.MockTransport(handler))
+
+    with caplog.at_level("INFO"):
+        with TestClient(app) as client:
+            res = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}]}
+            )
+            assert res.status_code == 200
+
+    assert len(seen) == 1
+    req_body = json.loads(seen[0].read())
+    assert "safetySettings" in req_body
+    assert req_body["safetySettings"] == [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    ]
+    assert any("safetySettings applied (2 categories)" in r.message for r in caplog.records)
+    assert any("HARM_CATEGORY_HARASSMENT" in r.message for r in caplog.records)
+
+
+def test_openai_proxy_chat_completions_unconfigured_preserves_behavior(caplog: pytest.LogCaptureFixture) -> None:
+    credentials = FakeCredentials()
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, stream=AsyncBytes(b'{"choices": [{"message": {"content": "Hello"}}]}'))
+
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        safety_settings=None,
+    )
+    app = create_app(settings, credentials=credentials, upstream_transport=httpx.MockTransport(handler))
+
+    with caplog.at_level("INFO"):
+        with TestClient(app) as client:
+            res = client.post(
+                "/v1/chat/completions",
+                json={"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}]}
+            )
+            assert res.status_code == 200
+
+    assert len(seen) == 1
+    req_body = json.loads(seen[0].read())
+    assert "safetySettings" not in req_body
+    assert any("safetySettings: None (using upstream defaults)" in r.message for r in caplog.records)
+
+
+def test_openai_proxy_diagnoses_prompt_blocked_and_prohibited_content(caplog: pytest.LogCaptureFixture) -> None:
+    credentials = FakeCredentials()
+
+    # Input-side blocked response
+    async def handler_input_blocked(request: httpx.Request) -> httpx.Response:
+        body = json.dumps({
+            "promptFeedback": {
+                "blockReason": "SAFETY",
+                "blockReasonMessage": "Input blocked by safety",
+                "safetyRatings": [{"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "probability": "HIGH", "blocked": True}]
+            },
+            "candidates": []
+        }).encode("utf-8")
+        return httpx.Response(200, stream=AsyncBytes(body))
+
+    app1 = create_app(Settings(project="sample-project", location="us-central1"), credentials=credentials, upstream_transport=httpx.MockTransport(handler_input_blocked))
+
+    with caplog.at_level("WARNING"):
+        with TestClient(app1) as client:
+            res = client.post("/v1/chat/completions", json={"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "blocked input"}]})
+            assert res.status_code == 200
+            assert any("Gemini prompt blocked (input-side)" in r.message for r in caplog.records)
+
+    # Output-side prohibited content response
+    async def handler_output_blocked(request: httpx.Request) -> httpx.Response:
+        body = json.dumps({
+            "candidates": [{
+                "finishReason": "PROHIBITED_CONTENT",
+                "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}]
+            }]
+        }).encode("utf-8")
+        return httpx.Response(200, stream=AsyncBytes(body))
+
+    app2 = create_app(Settings(project="sample-project", location="us-central1"), credentials=credentials, upstream_transport=httpx.MockTransport(handler_output_blocked))
+
+    with caplog.at_level("WARNING"):
+        with TestClient(app2) as client:
+            res = client.post("/v1/chat/completions", json={"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "test"}]})
+            assert res.status_code == 200
+            assert any("finishReason=PROHIBITED_CONTENT" in r.message for r in caplog.records)
 
 
 

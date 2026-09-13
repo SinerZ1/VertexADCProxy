@@ -262,6 +262,12 @@ def chat_completions_to_responses(
         status = "incomplete"
     elif finish_reason in {"content_filter", "safety"}:
         status = "failed"
+    elif finish_reason in {"prohibited_content", "PROHIBITED_CONTENT"}:
+        status = "failed"
+    elif finish_reason in {"other", "OTHER"}:
+        status = "failed"
+    elif finish_reason in {"prompt_blocked", "PROMPT_BLOCKED"}:
+        status = "failed"
 
     output: list[dict[str, Any]] = []
 
@@ -856,10 +862,11 @@ async def unary_responses_event(events_gen: AsyncIterator[AgentEvent], client_mo
                 }
             if "stop_reason" in event.data:
                 sr = event.data["stop_reason"]
-                if hasattr(sr, "value") and sr.value in {"pause_turn", "max_tokens"}:
+                sr_val = sr.value if hasattr(sr, "value") else str(sr)
+                if sr_val in {"pause_turn", "max_tokens"}:
                     status = "incomplete"
-                elif sr in {"pause_turn", "max_tokens"}:
-                    status = "incomplete"
+                elif sr_val in {"prompt_blocked", "refusal", "prohibited_content", "other", "error"}:
+                    status = "failed"
         elif event.kind == AgentEventKind.ERROR:
             status = "failed"
             error_msg = event.data.get("message")
@@ -1059,10 +1066,11 @@ async def stream_responses_events(events_gen: AsyncIterator[AgentEvent], client_
                 }
             if "stop_reason" in event.data:
                 sr = event.data["stop_reason"]
-                if hasattr(sr, "value") and sr.value in {"pause_turn", "max_tokens"}:
+                sr_val = sr.value if hasattr(sr, "value") else str(sr)
+                if sr_val in {"pause_turn", "max_tokens"}:
                     completed_status = "incomplete"
-                elif sr in {"pause_turn", "max_tokens"}:
-                    completed_status = "incomplete"
+                elif sr_val in {"prompt_blocked", "refusal", "prohibited_content", "other", "error"}:
+                    completed_status = "failed"
         elif event.kind == AgentEventKind.ERROR:
             err_msg = event.data.get("message", "Error")
             yield _sse("error", {"type": "error", "error": {"message": err_msg}})

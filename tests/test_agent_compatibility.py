@@ -5,7 +5,16 @@ import httpx
 from fastapi.testclient import TestClient
 
 from vertex_proxy.app import Settings, create_app
-from vertex_proxy.agent_ir import ToolKind, ToolExecution, AgentTool, parse_openai_tool, parse_anthropic_tool, BackendKind
+from vertex_proxy.agent_ir import (
+    ToolKind,
+    ToolExecution,
+    AgentTool,
+    AgentStopReason,
+    parse_openai_tool,
+    parse_anthropic_tool,
+    BackendKind,
+)
+from vertex_proxy.vertex_native import GeminiNativeCodec
 from vertex_proxy.agent_state import (
     InMemoryAgentStateStore,
     ResponseState,
@@ -1166,6 +1175,232 @@ def test_best_effort_mode_remains_unaffected() -> None:
         assert res.status_code == 200
         data = res.json()
         assert data["stop_reason"] == "tool_use"
+
+
+def test_native_codec_safety_settings_configured_and_unconfigured() -> None:
+    # When safety_settings is provided, safetySettings key is present in native_payload
+    payload = GeminiNativeCodec.encode_request(
+        contents=[{"role": "user", "parts": [{"text": "Hello"}]}],
+        tools=[],
+        model="gemini-2.5-flash",
+        safety_settings=[
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        ],
+    )
+    assert "safetySettings" in payload
+    assert payload["safetySettings"] == [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    ]
+
+    # Also accepts dict configuration
+    payload_dict = GeminiNativeCodec.encode_request(
+        contents=[{"role": "user", "parts": [{"text": "Hello"}]}],
+        tools=[],
+        model="gemini-2.5-flash",
+        safety_settings={
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE"
+        },
+    )
+    assert "safetySettings" in payload_dict
+    assert payload_dict["safetySettings"] == [
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+    ]
+
+    # When safety_settings is None or empty, safetySettings is strictly NOT in payload
+    payload_none = GeminiNativeCodec.encode_request(
+        contents=[{"role": "user", "parts": [{"text": "Hello"}]}],
+        tools=[],
+        model="gemini-2.5-flash",
+        safety_settings=None,
+    )
+    assert "safetySettings" not in payload_none
+
+    payload_empty = GeminiNativeCodec.encode_request(
+        contents=[{"role": "user", "parts": [{"text": "Hello"}]}],
+        tools=[],
+        model="gemini-2.5-flash",
+        safety_settings=[],
+    )
+    assert "safetySettings" not in payload_empty
+
+
+def test_native_codec_decode_prompt_blocked_vs_finish_reasons() -> None:
+    # 1. Input-side blocked via promptFeedback
+    blocked_input_resp = {
+        "promptFeedback": {
+            "blockReason": "SAFETY",
+            "blockReasonMessage": "Prompt violated safety policies.",
+            "safetyRatings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "probability": "HIGH", "blocked": True}
+            ]
+        },
+        "candidates": [],
+    }
+    resp = GeminiNativeCodec.decode_response(blocked_input_resp, "gemini-2.5-flash")
+    assert resp.stop_reason == AgentStopReason.PROMPT_BLOCKED
+    assert resp.output == []
+
+    # 2. Output-side prohibited content
+    prohibited_resp = {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": []},
+                "finishReason": "PROHIBITED_CONTENT",
+            }
+        ]
+    }
+    resp = GeminiNativeCodec.decode_response(prohibited_resp, "gemini-2.5-flash")
+    assert resp.stop_reason == AgentStopReason.PROHIBITED_CONTENT
+
+    # 3. Output-side other reason
+    other_resp = {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": []},
+                "finishReason": "OTHER",
+            }
+        ]
+    }
+    resp = GeminiNativeCodec.decode_response(other_resp, "gemini-2.5-flash")
+    assert resp.stop_reason == AgentStopReason.OTHER
+
+    # 4. Output-side safety
+    safety_resp = {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": []},
+                "finishReason": "SAFETY",
+            }
+        ]
+    }
+    resp = GeminiNativeCodec.decode_response(safety_resp, "gemini-2.5-flash")
+    assert resp.stop_reason == AgentStopReason.REFUSAL
+
+
+def test_anthropic_gemini_native_prompt_blocked_and_finish_reasons(caplog: pytest.LogCaptureFixture) -> None:
+    # Test streaming and unary mapping of prompt_blocked and prohibited_content in Anthropic endpoint
+    credentials = FakeCredentials()
+
+    # Case A: Input-side promptFeedback.blockReason streaming
+    async def handler_prompt_blocked(request: httpx.Request) -> httpx.Response:
+        sse_data = (
+            'data: {"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"Prompt unsafe","safetyRatings":[{"category":"HARM_CATEGORY_HATE_SPEECH","probability":"HIGH","blocked":true}]},"candidates":[]}\n\n'
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse_data.encode("utf-8")
+        )
+
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        proxy_api_key="local-secret",
+        safety_settings=(
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        ),
+    )
+    app = create_app(settings, credentials=credentials, upstream_transport=httpx.MockTransport(handler_prompt_blocked))
+
+    with caplog.at_level("WARNING"):
+        with TestClient(app) as client:
+            res = client.post(
+                "/v1/messages",
+                headers={"authorization": "Bearer local-secret"},
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [{"role": "user", "content": "Sensitive prompt"}],
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "stream": True,
+                }
+            )
+            assert res.status_code == 200
+            assert "prompt_blocked" in res.text
+            # Verify logging contains input-side interception diagnostic with no prompt text
+            assert any("Gemini prompt blocked (input-side)" in r.message for r in caplog.records)
+            assert not any("Sensitive prompt" in r.message for r in caplog.records)
+
+    # Case B: Output-side finishReason="PROHIBITED_CONTENT" unary
+    async def handler_prohibited(request: httpx.Request) -> httpx.Response:
+        native_response = {
+            "candidates": [
+                {
+                    "content": {"parts": []},
+                    "finishReason": "PROHIBITED_CONTENT",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 0, "totalTokenCount": 5}
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(native_response).encode("utf-8")
+        )
+
+    app_prohibited = create_app(settings, credentials=credentials, upstream_transport=httpx.MockTransport(handler_prohibited))
+
+    with caplog.at_level("WARNING"):
+        with TestClient(app_prohibited) as client:
+            res = client.post(
+                "/v1/messages",
+                headers={"authorization": "Bearer local-secret"},
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [{"role": "user", "content": "Another query"}],
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                }
+            )
+            assert res.status_code == 200
+            data = res.json()
+            assert data["stop_reason"] == "prohibited_content"
+            assert any("finishReason=PROHIBITED_CONTENT" in r.message for r in caplog.records)
+
+
+def test_native_runtime_propagates_safety_settings_to_upstream() -> None:
+    credentials = FakeCredentials()
+    seen_requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps({"candidates": [{"content": {"parts": [{"text": "OK"}]}, "finishReason": "STOP"}]}).encode("utf-8")
+        )
+
+    configured_safety = (
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    )
+    settings = Settings(
+        project="sample-project",
+        location="us-central1",
+        proxy_api_key="local-secret",
+        safety_settings=configured_safety,
+    )
+    app = create_app(settings, credentials=credentials, upstream_transport=httpx.MockTransport(handler))
+
+    with TestClient(app) as client:
+        res = client.post(
+            "/v1/messages",
+            headers={"authorization": "Bearer local-secret"},
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            }
+        )
+        assert res.status_code == 200
+
+    assert len(seen_requests) == 1
+    upstream_payload = json.loads(seen_requests[0].read())
+    assert "safetySettings" in upstream_payload
+    assert upstream_payload["safetySettings"] == [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
 
 
 

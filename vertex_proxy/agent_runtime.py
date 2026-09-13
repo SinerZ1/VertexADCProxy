@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+LOGGER = logging.getLogger("vertex_proxy.agent_runtime")
 
 from vertex_proxy.agent_ir import (
     AgentEvent,
@@ -105,6 +108,7 @@ class AgentRuntime:
     ) -> AsyncIterator[AgentEvent]:
         # Generate target Response ID
         response_id = f"resp_{secrets.token_hex(12)}"
+        req_id = request.metadata.get("request_id") or response_id
         yield AgentEvent(kind=AgentEventKind.RESPONSE_STARTED, data={"response_id": response_id})
 
         tool_mode = getattr(config, "agent_tool_mode", "best_effort")
@@ -493,6 +497,7 @@ class AgentRuntime:
                         system_instruction = m.get("content")
                         break
 
+            safety_settings = getattr(config, "safety_settings", None)
             native_payload = GeminiNativeCodec.encode_request(
                 contents=merged_contents,
                 tools=plan.provider_tools + plan.client_tools,
@@ -500,7 +505,9 @@ class AgentRuntime:
                 temperature=request.temperature,
                 top_p=request.top_p,
                 max_tokens=request.max_tokens,
-                system_instruction=system_instruction
+                system_instruction=system_instruction,
+                safety_settings=safety_settings,
+                request_id=req_id,
             )
 
             # Delete any resolved pending tool states
@@ -523,6 +530,7 @@ class AgentRuntime:
                     accumulated_parts = []
                     usage_info = {}
                     stop_reason = AgentStopReason.END_TURN
+                    log_id = f"[{req_id}] " if req_id else ""
 
                     async for chunk in chunk_iter:
                         if "usageMetadata" in chunk:
@@ -533,15 +541,58 @@ class AgentRuntime:
                                 "total_tokens": um.get("totalTokenCount", 0),
                             }
 
+                        prompt_feedback = chunk.get("promptFeedback")
+                        if isinstance(prompt_feedback, dict) and prompt_feedback.get("blockReason"):
+                            block_reason = prompt_feedback.get("blockReason")
+                            block_msg = prompt_feedback.get("blockReasonMessage")
+                            safety_ratings = prompt_feedback.get("safetyRatings", [])
+                            stop_reason = AgentStopReason.PROMPT_BLOCKED
+                            LOGGER.warning(
+                                "%sGemini prompt blocked (input-side): blockReason=%s, message=%s, safetyRatings=%s",
+                                log_id,
+                                block_reason,
+                                block_msg,
+                                safety_ratings,
+                            )
+
                         candidates = chunk.get("candidates", [])
                         if not candidates:
                             continue
                         candidate = candidates[0]
                         finish_reason = candidate.get("finishReason")
+                        candidate_ratings = candidate.get("safetyRatings", [])
                         if finish_reason == "MAX_TOKENS":
                             stop_reason = AgentStopReason.MAX_TOKENS
                         elif finish_reason in {"SAFETY", "RECITATION"}:
                             stop_reason = AgentStopReason.REFUSAL
+                            LOGGER.warning(
+                                "%sGemini generation blocked (output-side): finishReason=%s, safetyRatings=%s",
+                                log_id,
+                                finish_reason,
+                                candidate_ratings,
+                            )
+                        elif finish_reason == "PROHIBITED_CONTENT":
+                            stop_reason = AgentStopReason.PROHIBITED_CONTENT
+                            LOGGER.warning(
+                                "%sGemini generation blocked (output-side): finishReason=PROHIBITED_CONTENT, safetyRatings=%s",
+                                log_id,
+                                candidate_ratings,
+                            )
+                        elif finish_reason == "OTHER":
+                            stop_reason = AgentStopReason.OTHER
+                            LOGGER.warning(
+                                "%sGemini generation blocked (output-side): finishReason=OTHER, safetyRatings=%s",
+                                log_id,
+                                candidate_ratings,
+                            )
+                        elif finish_reason and finish_reason != "STOP":
+                            stop_reason = AgentStopReason.REFUSAL
+                            LOGGER.warning(
+                                "%sGemini generation stopped (output-side): finishReason=%s, safetyRatings=%s",
+                                log_id,
+                                finish_reason,
+                                candidate_ratings,
+                            )
 
                         content = candidate.get("content", {})
                         parts = content.get("parts", [])
@@ -637,7 +688,11 @@ class AgentRuntime:
                         api_version=plan.api_version
                     )
 
-                    agent_resp = GeminiNativeCodec.decode_response(native_resp, request.model)
+                    agent_resp = GeminiNativeCodec.decode_response(
+                        native_resp,
+                        request.model,
+                        request_id=req_id,
+                    )
 
                     # Also check for grounding metadata and yield web search events
                     candidates = native_resp.get("candidates", [])
